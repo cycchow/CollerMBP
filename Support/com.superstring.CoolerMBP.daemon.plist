@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.superstring.CoolerMBP.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/PrivilegedHelperTools/com.superstring.CoolerMBP.daemon</string>
+    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>com.superstring.CoolerMBP.daemon</key>
+        <true/>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>2</integer>
+    <key>ProcessType</key><string>Background</string>
+    <key>StandardOutPath</key><string>/var/log/CoolerMBP.log</string>
+    <key>StandardErrorPath</key><string>/var/log/CoolerMBP.log</string>
+</dict>
+</plist>

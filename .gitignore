@@ -1,0 +1,29 @@
+# Swift Package Manager and Xcode build products
+.build/
+.swiftpm/
+DerivedData/
+
+# Xcode per-user settings
+xcuserdata/
+*.xcuserstate
+
+# Generated local distribution binaries and app bundles
+dist/
+
+# macOS filesystem metadata
+.DS_Store
+
+# Local logs, temporary files, and environment/config secrets
+*.log
+*.tmp
+.env
+.env.*
+
+# Code-signing and notarization artifacts
+*.p12
+*.cer
+*.mobileprovision
+*.provisionprofile
+*.dSYM/
+*.zip
+*.pkg
