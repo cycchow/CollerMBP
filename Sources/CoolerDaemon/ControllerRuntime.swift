@@ -15,6 +15,11 @@ final class ControllerRuntime {
     private var manualSince: Date?
     private var temperatureSmoother = TemperatureMovingAverage(sampleCount: 10)
     private var lastError: String?
+    private var missingSensorPolls = 0
+    private var lastValidControlTemperature: Double?
+
+    // A transient SMC sensor gap should not immediately drop manual fan control.
+    private static let missingSensorPollLimit = 3
 
     private let configURL = URL(fileURLWithPath: "/Library/Application Support/CoolerMBP/config.json")
 
@@ -61,6 +66,8 @@ final class ControllerRuntime {
                 self.lastApplyDate = .distantPast
                 self.belowReleaseSince = nil
                 self.manualSince = nil
+                self.missingSensorPolls = 0
+                self.lastValidControlTemperature = nil
                 self.tick()
                 completion(.success(()))
             } catch {
@@ -93,6 +100,8 @@ final class ControllerRuntime {
 
             switch config.mode {
             case .appleAuto:
+                missingSensorPolls = 0
+                lastValidControlTemperature = nil
                 if lastAppliedLevel != nil || raw.fans.contains(where: { $0.mode == "manual" }) {
                     try fanController.resetAppleAutomatic()
                 }
@@ -106,6 +115,20 @@ final class ControllerRuntime {
 
             case .coolSurface:
                 guard let temperature = controlTemperature else {
+                    missingSensorPolls += 1
+                    if lastAppliedLevel != nil && missingSensorPolls < Self.missingSensorPollLimit {
+                        latestStatus = makeStatus(
+                            raw: raw,
+                            thermalState: thermalState,
+                            cpuPeak: cpuPeak,
+                            gpuPeak: gpuPeak,
+                            hottest: hottest,
+                            control: lastValidControlTemperature,
+                            target: lastAppliedLevel,
+                            error: "Temporary thermal sensor gap; retaining the last fan target."
+                        )
+                        return
+                    }
                     try fanController.resetAppleAutomatic()
                     try latchAppleAutomatic()
                     lastAppliedLevel = nil
@@ -116,6 +139,9 @@ final class ControllerRuntime {
                     latestStatus = makeStatus(raw: raw, thermalState: thermalState, cpuPeak: cpuPeak, gpuPeak: gpuPeak, hottest: hottest, control: nil, target: nil, error: tickError)
                     return
                 }
+
+                missingSensorPolls = 0
+                lastValidControlTemperature = temperature
 
                 if temperature < CoolingPolicy.releaseTemperature {
                     if belowReleaseSince == nil { belowReleaseSince = Date() }
@@ -168,6 +194,8 @@ final class ControllerRuntime {
             catch { lastError = "\(lastError ?? operationError); unable to persist safety mode: \(error)" }
             lastAppliedLevel = nil
             manualSince = nil
+            missingSensorPolls = 0
+            lastValidControlTemperature = nil
             temperatureSmoother.reset()
             latestStatus = DaemonStatus(
                 timestamp: Date(), mode: config.mode,
