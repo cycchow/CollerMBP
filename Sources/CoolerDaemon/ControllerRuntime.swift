@@ -17,9 +17,12 @@ final class ControllerRuntime {
     private var lastError: String?
     private var missingSensorPolls = 0
     private var lastValidControlTemperature: Double?
+    private var fanResponseFailurePolls = 0
 
     // A transient SMC sensor gap should not immediately drop manual fan control.
     private static let missingSensorPollLimit = 3
+    private static let fanResponseVerificationDelay: TimeInterval = 20
+    private static let fanResponseFailurePollLimit = 3
 
     private let configURL = URL(fileURLWithPath: "/Library/Application Support/CoolerMBP/config.json")
 
@@ -68,6 +71,8 @@ final class ControllerRuntime {
                 self.manualSince = nil
                 self.missingSensorPolls = 0
                 self.lastValidControlTemperature = nil
+                self.fanResponseFailurePolls = 0
+                self.lastError = nil
                 self.tick()
                 completion(.success(()))
             } catch {
@@ -85,8 +90,16 @@ final class ControllerRuntime {
             let raw = try fanController.status()
             if lastAppliedLevel != nil,
                let manualSince,
-               Date().timeIntervalSince(manualSince) >= 10 {
-                try FanController.verifyFanResponse(raw.fans)
+               Date().timeIntervalSince(manualSince) >= Self.fanResponseVerificationDelay {
+                do {
+                    try FanController.verifyFanResponse(raw.fans)
+                    fanResponseFailurePolls = 0
+                } catch {
+                    fanResponseFailurePolls += 1
+                    if fanResponseFailurePolls >= Self.fanResponseFailurePollLimit {
+                        throw error
+                    }
+                }
             }
             let thermalState = Self.thermalStateName()
             let cpuPeak = Self.peak(raw.temperatures, prefixes: ["TC", "Tp"])
@@ -102,6 +115,7 @@ final class ControllerRuntime {
             case .appleAuto:
                 missingSensorPolls = 0
                 lastValidControlTemperature = nil
+                fanResponseFailurePolls = 0
                 if lastAppliedLevel != nil || raw.fans.contains(where: { $0.mode == "manual" }) {
                     try fanController.resetAppleAutomatic()
                 }
@@ -129,13 +143,16 @@ final class ControllerRuntime {
                         )
                         return
                     }
+                    let message = "No valid thermal sensors were found; returned fan control to macOS."
+                    recordSafetyFallback(message)
                     try fanController.resetAppleAutomatic()
                     try latchAppleAutomatic()
                     lastAppliedLevel = nil
                     belowReleaseSince = nil
                     manualSince = nil
+                    fanResponseFailurePolls = 0
                     temperatureSmoother.reset()
-                    tickError = "No valid thermal sensors were found; returned fan control to macOS."
+                    tickError = message
                     latestStatus = makeStatus(raw: raw, thermalState: thermalState, cpuPeak: cpuPeak, gpuPeak: gpuPeak, hottest: hottest, control: nil, target: nil, error: tickError)
                     return
                 }
@@ -182,7 +199,11 @@ final class ControllerRuntime {
                 }
             }
 
-            lastError = tickError
+            if let tickError {
+                lastError = tickError
+            } else if config.mode != .appleAuto {
+                lastError = nil
+            }
             latestStatus = makeStatus(raw: raw, thermalState: thermalState, cpuPeak: cpuPeak, gpuPeak: gpuPeak, hottest: hottest, control: controlTemperature, target: targetLevel, error: tickError)
         } catch {
             let operationError = String(describing: error)
@@ -196,7 +217,9 @@ final class ControllerRuntime {
             manualSince = nil
             missingSensorPolls = 0
             lastValidControlTemperature = nil
+            fanResponseFailurePolls = 0
             temperatureSmoother.reset()
+            recordSafetyFallback(lastError ?? operationError)
             latestStatus = DaemonStatus(
                 timestamp: Date(), mode: config.mode,
                 controlTemperature: nil, cpuPeakTemperature: nil, gpuPeakTemperature: nil,
@@ -212,7 +235,10 @@ final class ControllerRuntime {
         let needsRefresh = Date().timeIntervalSince(lastApplyDate) >= 10
         if lastAppliedLevel == nil || abs((lastAppliedLevel ?? 0) - clamped) >= 0.025 || needsRefresh {
             try fanController.setCoolingLevel(clamped)
-            if lastAppliedLevel == nil { manualSince = Date() }
+            if lastAppliedLevel == nil {
+                manualSince = Date()
+                fanResponseFailurePolls = 0
+            }
             lastAppliedLevel = clamped
             lastApplyDate = Date()
         }
@@ -251,6 +277,11 @@ final class ControllerRuntime {
         candidate.mode = .appleAuto
         try saveConfig(candidate)
         config = candidate
+    }
+
+    private func recordSafetyFallback(_ message: String) {
+        lastError = message
+        fputs("CoolerMBP: \(message)\n", stderr)
     }
 
     private static func loadConfig(from url: URL) -> DaemonConfig? {
