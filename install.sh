@@ -36,11 +36,21 @@ sudo chown -R root:wheel /Applications/CoolerMBP.app
 sudo chmod -R go-w /Applications/CoolerMBP.app
 
 sleep 1
-sudo /usr/local/bin/coolermbpctl auto
+sudo /usr/local/bin/coolermbpctl ping || {
+  echo "Daemon XPC handshake failed. Startup/authorization diagnostics:" >&2
+  sudo tail -30 /var/log/CoolerMBP.log
+  exit 1
+}
+sudo /usr/local/bin/coolermbpctl auto || {
+  echo "Daemon answered ping, but Apple Automatic mode failed. Diagnostics:" >&2
+  sudo tail -30 /var/log/CoolerMBP.log
+  exit 1
+}
 sudo /usr/local/bin/coolermbpctl status || {
   echo
   echo "Daemon did not answer. Check: sudo launchctl print system/$LABEL" >&2
   echo "Emergency Apple-auto command: sudo /usr/local/sbin/coolermbpsmc auto" >&2
+  sudo tail -30 /var/log/CoolerMBP.log
   exit 1
 }
 

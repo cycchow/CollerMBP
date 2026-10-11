@@ -55,6 +55,7 @@ The installer builds locally, installs the root daemon and recovery CLI, places 
 
 ```bash
 sudo coolermbpctl status
+sudo coolermbpctl ping  # Test XPC connectivity without waiting for sensor polling.
 sudo coolermbpctl cool
 sudo coolermbpctl max
 sudo coolermbpctl auto

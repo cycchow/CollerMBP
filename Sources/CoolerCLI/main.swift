@@ -15,7 +15,7 @@ final class Client {
     func status() -> Int32 {
         let sem = DispatchSemaphore(value: 0)
         var exitCode: Int32 = 1
-        guard let proxy = proxy() else { return 1 }
+        guard let proxy = proxy(onError: { sem.signal() }) else { return 1 }
         proxy.fetchStatus { data, error in
             defer { sem.signal() }
             if let error {
@@ -40,7 +40,7 @@ final class Client {
             }
         }
         if sem.wait(timeout: .now() + 5) == .timedOut {
-            fputs("error: daemon did not respond\n", stderr)
+            fputs("error: status request timed out after 5 seconds (client pid \(getpid()))\n", stderr)
             return 1
         }
         return exitCode
@@ -49,7 +49,7 @@ final class Client {
     func setMode(_ mode: CoolingMode) -> Int32 {
         let sem = DispatchSemaphore(value: 0)
         var exitCode: Int32 = 1
-        guard let proxy = proxy() else { return 1 }
+        guard let proxy = proxy(onError: { sem.signal() }) else { return 1 }
         proxy.setMode(mode.rawValue as NSString) { success, error in
             if success {
                 print("mode set to \(mode.rawValue)")
@@ -60,15 +60,32 @@ final class Client {
             sem.signal()
         }
         if sem.wait(timeout: .now() + 8) == .timedOut {
-            fputs("error: daemon did not respond\n", stderr)
+            fputs("error: \(mode.rawValue) request timed out after 8 seconds (client pid \(getpid()))\n", stderr)
             return 1
         }
         return exitCode
     }
 
-    private func proxy() -> CoolerDaemonXPCProtocol? {
+    func ping() -> Int32 {
+        let sem = DispatchSemaphore(value: 0)
+        var exitCode: Int32 = 1
+        guard let proxy = proxy(onError: { sem.signal() }) else { return 1 }
+        proxy.ping { response in
+            print(response)
+            exitCode = response == "pong" ? 0 : 1
+            sem.signal()
+        }
+        if sem.wait(timeout: .now() + 5) == .timedOut {
+            fputs("error: XPC ping timed out after 5 seconds (client pid \(getpid()))\n", stderr)
+            return 1
+        }
+        return exitCode
+    }
+
+    private func proxy(onError: @escaping () -> Void) -> CoolerDaemonXPCProtocol? {
         connection.remoteObjectProxyWithErrorHandler { error in
             fputs("XPC error: \(error)\n", stderr)
+            onError()
         } as? CoolerDaemonXPCProtocol
     }
 }
@@ -79,11 +96,12 @@ let client = Client()
 let code: Int32
 switch command {
 case "status": code = client.status()
+case "ping": code = client.ping()
 case "auto", "reset": code = client.setMode(.appleAuto)
 case "cool": code = client.setMode(.coolSurface)
 case "max": code = client.setMode(.maximum)
 default:
-    print("usage: coolermbpctl [status|auto|cool|max]")
+    print("usage: coolermbpctl [status|ping|auto|cool|max]")
     code = 2
 }
 exit(code)

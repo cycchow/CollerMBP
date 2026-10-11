@@ -52,7 +52,7 @@ final class ControllerRuntime {
     }
 
     func start() {
-        queue.async {
+        queue.async { [self] in
             self.tick()
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
             timer.schedule(deadline: .now() + 2, repeating: 2)
