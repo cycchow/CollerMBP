@@ -8,7 +8,20 @@ final class ControllerRuntime {
     private let policy = CoolingPolicy()
     private var timer: DispatchSourceTimer?
     private var config: DaemonConfig
-    private var latestStatus: DaemonStatus
+    private let statusLock = NSLock()
+    private var cachedStatus: DaemonStatus
+    private var latestStatus: DaemonStatus {
+        get {
+            statusLock.lock()
+            defer { statusLock.unlock() }
+            return cachedStatus
+        }
+        set {
+            statusLock.lock()
+            defer { statusLock.unlock() }
+            cachedStatus = newValue
+        }
+    }
     private var lastAppliedLevel: Double?
     private var lastApplyDate: Date = .distantPast
     private var belowReleaseSince: Date?
@@ -29,12 +42,12 @@ final class ControllerRuntime {
     init() throws {
         fanController = try FanController()
         config = Self.loadConfig(from: configURL) ?? DaemonConfig()
-        latestStatus = DaemonStatus(
+        cachedStatus = DaemonStatus(
             timestamp: Date(), mode: config.mode,
             controlTemperature: nil, cpuPeakTemperature: nil, gpuPeakTemperature: nil,
             hottestSensorTemperature: nil, thermalState: Self.thermalStateName(),
             targetCoolingLevel: nil, fans: [], temperatures: [:],
-            hardwareInfo: fanController.hardwareInfo, lastError: nil
+            hardwareInfo: fanController.hardwareInfo, lastError: "Waiting for the first SMC sensor poll."
         )
     }
 
@@ -82,7 +95,8 @@ final class ControllerRuntime {
     }
 
     func getStatus(completion: @escaping (DaemonStatus) -> Void) {
-        queue.async { completion(self.latestStatus) }
+        // Never wait behind SMC I/O or encode XPC replies on the controller queue.
+        completion(latestStatus)
     }
 
     private func tick() {

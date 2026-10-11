@@ -38,6 +38,7 @@ final class AppState: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 if let error {
+                    self.status = nil
                     self.connectionError = error as String
                     return
                 }

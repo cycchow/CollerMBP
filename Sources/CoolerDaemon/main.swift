@@ -10,6 +10,11 @@ final class DaemonService: NSObject, CoolerDaemonXPCProtocol {
 
     func fetchStatus(withReply reply: @escaping (NSData?, NSString?) -> Void) {
         runtime.getStatus { status in
+            let age = Date().timeIntervalSince(status.timestamp)
+            guard age <= 10 else {
+                reply(nil, "SMC status is stale (last update \(Int(age)) seconds ago); sensor polling may be delayed." as NSString)
+                return
+            }
             do {
                 let encoder = JSONEncoder()
                 encoder.dateEncodingStrategy = .iso8601
