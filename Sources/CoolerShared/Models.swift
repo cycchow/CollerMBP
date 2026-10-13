@@ -47,6 +47,7 @@ public struct DaemonStatus: Codable, Sendable {
     public let temperatures: [String: Double]
     public let hardwareInfo: String
     public let lastError: String?
+    public let recoveryRequired: Bool?
 
     public init(
         timestamp: Date,
@@ -60,7 +61,8 @@ public struct DaemonStatus: Codable, Sendable {
         fans: [FanReading],
         temperatures: [String: Double],
         hardwareInfo: String,
-        lastError: String?
+        lastError: String?,
+        recoveryRequired: Bool? = false
     ) {
         self.timestamp = timestamp
         self.mode = mode
@@ -74,6 +76,7 @@ public struct DaemonStatus: Codable, Sendable {
         self.temperatures = temperatures
         self.hardwareInfo = hardwareInfo
         self.lastError = lastError
+        self.recoveryRequired = recoveryRequired
     }
 }
 

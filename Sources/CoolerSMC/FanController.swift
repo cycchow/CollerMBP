@@ -202,59 +202,68 @@ public final class FanController {
     public func resetAppleAutomatic(allowUnknownFtstRelease: Bool = false) throws {
         guard writeEnabled else { throw FanControllerError.recoveryFailed(["SMC writer lock unavailable; controller is read-only"]) }
         let count = try fanCount()
-        var failures: [String] = []
-        var reconciliationNeeded = false
-        var changedFanMode = false
-        for index in 0..<count {
-            do {
-                let modeKey = try modeKey(for: index)
-                let state = try fanInfo(index)
-                if state.mode != "auto" && state.mode != "system" {
-                    reconciliationNeeded = true
-                    logEvent("automatic_restore_requested", "fan=\(index) mode=\(state.mode)")
-                    let result = smc.writeKey(modeKey, bytes: [0])
-                    if !result.success { failures.append("\(modeKey) write rejected (kernel=\(String(describing: result.kernelReturn)), firmware=\(String(describing: result.firmwareResult)))") }
-                    else { changedFanMode = true }
-                }
-            } catch { failures.append("fan \(index): \(error)") }
+        // Read and validate the full recovery state before the first write.
+        let fans = try (0..<count).map(fanInfo)
+        for fan in fans where fan.mode != "auto" && fan.mode != "system" && fan.mode != "manual" {
+            throw FanControllerError.recoveryFailed(["fan \(fan.index) has unsupported mode \(fan.mode)"])
         }
-        for index in 0..<count {
-            let deadline = Date().addingTimeInterval(2)
-            var restored = false
-            repeat {
-                let mode = try? fanInfo(index).mode
-                if mode == "auto" || mode == "system" {
-                    restored = true
-                    break
-                }
-                Thread.sleep(forTimeInterval: 0.1)
-            } while Date() < deadline
-            if !restored { failures.append("fan \(index) mode verification") }
-        }
+        var ftstValue: UInt8?
         if ftstAvailability == "available" {
             let ftst = smc.readKey(Self.forceTestKey)
             guard ftst.success, ftst.size == 1, ftst.type == "ui8 ", ftst.bytes.count == 1 else {
-                failures.append("Ftst ownership cannot be verified")
-                throw FanControllerError.recoveryFailed(failures)
+                throw FanControllerError.recoveryFailed(["Ftst ownership cannot be verified"])
             }
-            var verifyFtstReleased = ftst.bytes[0] == 0 || ownsFtst
-            if ftst.bytes[0] == 1 && !ownsFtst {
+            ftstValue = ftst.bytes[0]
+            guard ftst.bytes[0] <= 1 else {
+                throw FanControllerError.recoveryFailed(["Ftst has unsupported active value \(ftst.bytes[0])"])
+            }
+            if ftst.bytes[0] == 1 && !ownsFtst && !allowUnknownFtstRelease {
+                throw FanControllerError.recoveryFailed(["Ftst is active with unknown ownership"])
+            }
+        } else if ownsFtst {
+            throw FanControllerError.recoveryFailed(["Ftst was previously owned but is now unavailable"])
+        }
+
+        var failures: [String] = []
+        var reconciliationNeeded = false
+        var changedFanMode = false
+        for fan in fans where fan.mode == "manual" {
+            let modeKey = fan.modeKey!
+            reconciliationNeeded = true
+            logEvent("automatic_restore_requested", "fan=\(fan.index) mode=\(fan.mode)")
+            let result = smc.writeKey(modeKey, bytes: [0])
+            if !result.success {
+                failures.append("\(modeKey) write rejected (kernel=\(String(describing: result.kernelReturn)), firmware=\(String(describing: result.firmwareResult)))")
+            } else {
+                changedFanMode = true
+            }
+        }
+        var fansVerified = true
+        for fan in fans {
+            let deadline = Date().addingTimeInterval(2)
+            var restored = false
+            repeat {
+                let mode = try? fanInfo(fan.index).mode
+                if mode == "auto" || mode == "system" { restored = true; break }
+                Thread.sleep(forTimeInterval: 0.1)
+            } while Date() < deadline
+            if !restored { fansVerified = false; failures.append("fan \(fan.index) mode verification") }
+        }
+        if let ftstValue {
+            if ftstValue == 1 && !ownsFtst {
                 reconciliationNeeded = true
-                if allowUnknownFtstRelease {
+                if fansVerified && allowUnknownFtstRelease {
                     logEvent("explicit_unknown_ftst_recovery", "admin_requested=true")
                     let result = smc.writeKey(Self.forceTestKey, bytes: [0])
-                    verifyFtstReleased = true
                     if !result.success { failures.append("explicit Ftst release rejected") }
-                } else {
-                    failures.append("Ftst is active with unknown ownership")
                 }
-            } else if ftst.bytes[0] == 1 {
+            } else if ftstValue == 1 && ownsFtst && fansVerified {
                 reconciliationNeeded = true
                 logEvent("automatic_restore_requested", "releasing_owned_ftst=true")
                 let result = smc.writeKey(Self.forceTestKey, bytes: [0])
                 if !result.success { failures.append("Ftst release rejected") }
             }
-            if verifyFtstReleased {
+            if ftstValue == 0 || (fansVerified && (ownsFtst || allowUnknownFtstRelease)) {
                 let verify = smc.readKey(Self.forceTestKey)
                 if !verify.success || verify.size != 1 || verify.type != "ui8 " || verify.bytes != [0] {
                     failures.append("Ftst release verification")
@@ -270,8 +279,6 @@ public final class FanController {
                     // A zero flag that CoolerMBP did not set needs no ownership mutation.
                 }
             }
-        } else if ownsFtst {
-            failures.append("Ftst was previously owned but is now unavailable")
         }
         if !failures.isEmpty {
             logEvent("automatic_restore_failed", failures.joined(separator: ";"))

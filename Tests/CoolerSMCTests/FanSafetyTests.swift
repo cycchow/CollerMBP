@@ -70,6 +70,47 @@ final class FanSafetyTests: XCTestCase {
         XCTAssertEqual(smc.writeCounts["Ftst"], nil)
     }
 
+    func testUnknownFtstPreflightPreventsAllFanModeWrites() throws {
+        let smc = MockSMC(fanCount: 1, hasFtst: true)
+        smc.values["F0md"] = [1]
+        smc.values["Ftst"] = [1]
+        let controller = FanController(smc: smc)
+
+        XCTAssertThrowsError(try controller.resetAppleAutomatic())
+        XCTAssertEqual(smc.values["F0md"], [1])
+        XCTAssertNil(smc.writeCounts["F0md"])
+        XCTAssertNil(smc.writeCounts["Ftst"])
+    }
+
+    func testUnsupportedFtstValueBlocksAllFanModeWrites() throws {
+        let smc = MockSMC(fanCount: 1, hasFtst: true)
+        smc.values["F0md"] = [1]
+        smc.values["Ftst"] = [2]
+
+        XCTAssertThrowsError(try FanController(smc: smc).resetAppleAutomatic())
+        XCTAssertEqual(smc.values["F0md"], [1])
+        XCTAssertNil(smc.writeCounts["F0md"])
+        XCTAssertNil(smc.writeCounts["Ftst"])
+    }
+
+    func testPartialFanRestoreKeepsOwnedFtstActive() throws {
+        let smc = MockSMC(fanCount: 2, hasFtst: true)
+        smc.values["F0md"] = [1]
+        smc.values["F1md"] = [1]
+        smc.values["Ftst"] = [1]
+        smc.failingWrites.insert("F1md")
+        let url = URL(fileURLWithPath: "/private/tmp/CoolerMBP-test-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try Data("{\"ownsFtst\":true}".utf8).write(to: url)
+
+        XCTAssertThrowsError(try FanController(smc: smc, recoveryURL: url).resetAppleAutomatic())
+        XCTAssertEqual(smc.values["F0md"], [0])
+        XCTAssertEqual(smc.values["F1md"], [1])
+        XCTAssertEqual(smc.values["Ftst"], [1])
+        XCTAssertNil(smc.writeCounts["Ftst"])
+        XCTAssertEqual(try Data(contentsOf: url), Data("{\"ownsFtst\":true}".utf8))
+    }
+
     func testExplicitUnknownFtstRecoveryReleasesAndVerifies() throws {
         let smc = MockSMC(fanCount: 1, hasFtst: true)
         smc.values["Ftst"] = [1]

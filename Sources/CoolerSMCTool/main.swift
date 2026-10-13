@@ -62,13 +62,15 @@ do {
         defer { withExtendedLifetime(writerLock) {} }
         try controller.resetAppleAutomatic(allowUnknownFtstRelease: true)
         print("unknown Ftst override explicitly released and verified")
-    case "max":
+    case "lock-check":
         let writerLock = try SMCWriterLock()
         defer { withExtendedLifetime(writerLock) {} }
-        try controller.setMaximum()
-        print("fans set to hardware maximum")
+        print("SMC writer lock acquired")
+    case "max":
+        fputs("Standalone maximum control is disabled. Use sudo coolermbpctl max while the daemon is running.\n", stderr)
+        exit(2)
     default:
-        print("usage: sudo coolermbpsmc [status|diagnose|auto|recover-unknown-ftst|max]")
+        print("usage: sudo coolermbpsmc [status|diagnose|auto|recover-unknown-ftst|lock-check]")
         exit(2)
     }
 } catch {

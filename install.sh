@@ -35,6 +35,7 @@ sudo install -o root -g wheel -m 644 dist/com.superstring.CoolerMBP.daemon.plist
 sudo install -o root -g wheel -m 750 dist/coolermbpctl /usr/local/bin/coolermbpctl
 sudo mkdir -p /usr/local/sbin
 sudo install -o root -g wheel -m 755 dist/coolermbpsmc /usr/local/sbin/coolermbpsmc
+sudo install -o root -g wheel -m 755 recover.sh /usr/local/sbin/coolermbp-recover
 
 sudo launchctl bootstrap system "$PLIST"
 sudo launchctl enable "system/$LABEL"
@@ -59,7 +60,7 @@ sudo /usr/local/bin/coolermbpctl auto || {
 sudo /usr/local/bin/coolermbpctl status || {
   echo
   echo "Daemon did not answer. Check: sudo launchctl print system/$LABEL" >&2
-  echo "Emergency Apple-auto command: sudo /usr/local/sbin/coolermbpsmc auto" >&2
+  echo "Emergency recovery: sudo /usr/local/sbin/coolermbp-recover" >&2
   sudo tail -30 /var/log/CoolerMBP.log
   exit 1
 }

@@ -87,12 +87,64 @@ final class ControllerRuntime {
 
     func setMode(_ mode: CoolingMode, completion: @escaping (Result<Void, Error>) -> Void) {
         queue.async {
+            if mode == .appleAuto {
+                do {
+                    try self.fanController.resetAppleAutomatic()
+                    let raw = try self.fanController.status()
+                    guard raw.fans.allSatisfy({ $0.mode == "auto" || $0.mode == "system" }) else {
+                        throw RuntimeTransitionError.failed("fan mode readback did not confirm Apple Automatic")
+                    }
+                    var candidate = self.config
+                    candidate.mode = .appleAuto
+                    try self.saveConfig(candidate)
+                    self.config = candidate
+                    self.recoveryRequired = false
+                    self.lastError = nil
+                    self.lastAppliedLevel = nil
+                    self.lastApplyDate = .distantPast
+                    self.belowReleaseSince = nil
+                    self.manualSince = nil
+                    self.missingSensorPolls = 0
+                    self.lastValidControlTemperature = nil
+                    self.fanResponseFailurePolls = 0
+                    self.temperatureSmoother.reset()
+                    self.latestStatus = DaemonStatus(
+                        timestamp: Date(), mode: .appleAuto,
+                        controlTemperature: nil,
+                        cpuPeakTemperature: Self.peak(raw.temperatures, prefixes: ["TC", "Tp"]),
+                        gpuPeakTemperature: Self.peak(raw.temperatures, prefixes: ["TG", "Tg"]),
+                        hottestSensorTemperature: raw.temperatures.values.max(),
+                        thermalState: Self.thermalStateName(), targetCoolingLevel: nil,
+                        fans: raw.fans, temperatures: raw.temperatures,
+                        hardwareInfo: self.fanController.hardwareInfo, lastError: nil,
+                        recoveryRequired: false
+                    )
+                    completion(.success(()))
+                } catch {
+                    self.recoveryRequired = true
+                    self.lastError = "Apple Automatic recovery failed: \(error)"
+                    let raw = try? self.fanController.status()
+                    self.latestStatus = DaemonStatus(
+                        timestamp: Date(), mode: self.config.mode,
+                        controlTemperature: nil,
+                        cpuPeakTemperature: raw.flatMap { Self.peak($0.temperatures, prefixes: ["TC", "Tp"]) },
+                        gpuPeakTemperature: raw.flatMap { Self.peak($0.temperatures, prefixes: ["TG", "Tg"]) },
+                        hottestSensorTemperature: raw?.temperatures.values.max(),
+                        thermalState: Self.thermalStateName(), targetCoolingLevel: nil,
+                        fans: raw?.fans ?? [], temperatures: raw?.temperatures ?? [:],
+                        hardwareInfo: self.fanController.hardwareInfo, lastError: self.lastError,
+                        recoveryRequired: true
+                    )
+                    completion(.failure(error))
+                }
+                return
+            }
+
             let previous = self.config
             do {
                 if self.recoveryRequired && mode != .appleAuto {
                     throw RuntimeTransitionError.failed("Recovery is required; manual modes are disabled")
                 }
-                if mode == .appleAuto { self.recoveryRequired = false }
                 var candidate = self.config
                 candidate.mode = mode
                 self.config = candidate
@@ -126,6 +178,18 @@ final class ControllerRuntime {
                 if self.config.mode != .appleAuto {
                     self.config = previous
                 }
+                let raw = try? self.fanController.status()
+                self.latestStatus = DaemonStatus(
+                    timestamp: Date(), mode: self.config.mode,
+                    controlTemperature: nil,
+                    cpuPeakTemperature: raw.flatMap { Self.peak($0.temperatures, prefixes: ["TC", "Tp"]) },
+                    gpuPeakTemperature: raw.flatMap { Self.peak($0.temperatures, prefixes: ["TG", "Tg"]) },
+                    hottestSensorTemperature: raw?.temperatures.values.max(),
+                    thermalState: Self.thermalStateName(), targetCoolingLevel: nil,
+                    fans: raw?.fans ?? [], temperatures: raw?.temperatures ?? [:],
+                    hardwareInfo: self.fanController.hardwareInfo, lastError: String(describing: error),
+                    recoveryRequired: self.recoveryRequired
+                )
                 completion(.failure(error))
             }
         }
@@ -146,33 +210,50 @@ final class ControllerRuntime {
                     gpuPeakTemperature: Self.peak(raw.temperatures, prefixes: ["TG", "Tg"]),
                     hottestSensorTemperature: raw.temperatures.values.max(), thermalState: Self.thermalStateName(),
                     targetCoolingLevel: nil, fans: raw.fans, temperatures: raw.temperatures,
-                    hardwareInfo: fanController.hardwareInfo, lastError: lastError
+                    hardwareInfo: fanController.hardwareInfo, lastError: lastError,
+                    recoveryRequired: true
                 )
             } catch { lastError = "Recovery required; read-only status failed: \(error)" }
             return
         }
         do {
-            let raw = try fanController.status()
+            var raw = try fanController.status()
             if let applied = lastAppliedLevel,
                raw.fans.contains(where: { fan in
                    let expected = Double(fan.minRPM) + applied * Double(fan.maxRPM - fan.minRPM)
                    return fan.mode != "manual" || abs(Double(fan.targetRPM) - expected) > 150
                }) {
-                let message = "Fan mode or target changed outside CoolerMBP; control paused for recovery."
-                fputs("CoolerMBP: event=unexpected_fan_state_change action=pause_control\n", stderr)
+                var message = "Fan mode or target changed outside CoolerMBP; control paused for recovery."
+                if raw.fans.allSatisfy({ $0.mode == "manual" }) {
+                    do {
+                        try fanController.resetAppleAutomatic()
+                        raw = try fanController.status()
+                        guard raw.fans.allSatisfy({ $0.mode == "auto" || $0.mode == "system" }) else {
+                            throw RuntimeTransitionError.failed("fan mode readback did not confirm Apple Automatic")
+                        }
+                        try latchAppleAutomatic()
+                        recoveryRequired = false
+                        message = "Unexpected fan target detected; CoolerMBP released manual control and verified Apple Automatic."
+                    } catch {
+                        recoveryRequired = true
+                        message = "Unexpected fan state change; recovery is required: \(error)"
+                    }
+                } else {
+                    // A changed mode may belong to another controller. Leave it alone.
+                    recoveryRequired = true
+                }
+                fputs("CoolerMBP: event=unexpected_fan_state_change recoveryRequired=\(recoveryRequired)\n", stderr)
                 lastAppliedLevel = nil
                 manualSince = nil
-                recoveryRequired = true
                 lastError = message
-                do { try latchAppleAutomatic() }
-                catch { lastError = "\(message) Unable to persist Apple Automatic: \(error)" }
                 latestStatus = DaemonStatus(
                     timestamp: Date(), mode: config.mode,
                     controlTemperature: nil, cpuPeakTemperature: Self.peak(raw.temperatures, prefixes: ["TC", "Tp"]),
                     gpuPeakTemperature: Self.peak(raw.temperatures, prefixes: ["TG", "Tg"]),
                     hottestSensorTemperature: raw.temperatures.values.max(), thermalState: Self.thermalStateName(),
                     targetCoolingLevel: nil, fans: raw.fans, temperatures: raw.temperatures,
-                    hardwareInfo: fanController.hardwareInfo, lastError: lastError
+                    hardwareInfo: fanController.hardwareInfo, lastError: lastError,
+                    recoveryRequired: recoveryRequired
                 )
                 return
             }
@@ -198,6 +279,7 @@ final class ControllerRuntime {
 
             var targetLevel: Double?
             var tickError: String?
+            var hardwareTransitioned = false
 
             switch config.mode {
             case .appleAuto:
@@ -205,12 +287,14 @@ final class ControllerRuntime {
                 lastValidControlTemperature = nil
                 fanResponseFailurePolls = 0
                 try fanController.resetAppleAutomatic()
+                hardwareTransitioned = true
                 lastAppliedLevel = nil
                 belowReleaseSince = nil
                 manualSince = nil
+                recoveryRequired = false
 
             case .maximum:
-                try apply(level: 1.0)
+                hardwareTransitioned = try apply(level: 1.0)
                 targetLevel = 1.0
 
             case .coolSurface:
@@ -232,13 +316,16 @@ final class ControllerRuntime {
                     let message = "No valid thermal sensors were found; returned fan control to macOS."
                     recordSafetyFallback(message)
                     try fanController.resetAppleAutomatic()
+                    hardwareTransitioned = true
                     try latchAppleAutomatic()
+                    recoveryRequired = false
                     lastAppliedLevel = nil
                     belowReleaseSince = nil
                     manualSince = nil
                     fanResponseFailurePolls = 0
                     temperatureSmoother.reset()
                     tickError = message
+                    raw = try fanController.status()
                     latestStatus = makeStatus(raw: raw, thermalState: thermalState, cpuPeak: cpuPeak, gpuPeak: gpuPeak, hottest: hottest, control: nil, target: nil, error: tickError)
                     return
                 }
@@ -273,11 +360,12 @@ final class ControllerRuntime {
                     } else {
                         level = desired
                     }
-                    try apply(level: level)
+                    hardwareTransitioned = try apply(level: level)
                     targetLevel = level
                 } else {
                     if currentlyManual {
                         try fanController.resetAppleAutomatic()
+                        hardwareTransitioned = true
                     }
                     lastAppliedLevel = nil
                     manualSince = nil
@@ -290,23 +378,36 @@ final class ControllerRuntime {
             } else if config.mode != .appleAuto {
                 lastError = nil
             }
+            if hardwareTransitioned { raw = try fanController.status() }
             latestStatus = makeStatus(raw: raw, thermalState: thermalState, cpuPeak: cpuPeak, gpuPeak: gpuPeak, hottest: hottest, control: controlTemperature, target: targetLevel, error: tickError)
         } catch {
             let operationError = String(describing: error)
             lastError = operationError
             // Failure to read/control sensors is safer when macOS regains authority.
             var restored = false
+            var actualStatus: RawThermalStatus?
             do {
                 try fanController.resetAppleAutomatic()
+                let verified = try fanController.status()
+                actualStatus = verified
+                guard verified.fans.allSatisfy({ $0.mode == "auto" || $0.mode == "system" }) else {
+                    throw RuntimeTransitionError.failed("fan mode readback did not confirm Apple Automatic")
+                }
                 restored = true
-                recoveryRequired = false
             } catch {
                 recoveryRequired = true
                 lastError = "\(operationError); recovery failed: \(error)"
+                actualStatus = try? fanController.status()
             }
             if restored {
-                do { try latchAppleAutomatic() }
-                catch { lastError = "\(lastError ?? operationError); unable to persist safety mode: \(error)" }
+                do {
+                    try latchAppleAutomatic()
+                    recoveryRequired = false
+                }
+                catch {
+                    recoveryRequired = true
+                    lastError = "\(lastError ?? operationError); unable to persist safety mode: \(error)"
+                }
             }
             lastAppliedLevel = nil
             manualSince = nil
@@ -315,17 +416,22 @@ final class ControllerRuntime {
             fanResponseFailurePolls = 0
             temperatureSmoother.reset()
             recordSafetyFallback(lastError ?? operationError)
+            let fans = actualStatus?.fans ?? []
+            let temperatures = actualStatus?.temperatures ?? [:]
             latestStatus = DaemonStatus(
                 timestamp: Date(), mode: config.mode,
-                controlTemperature: nil, cpuPeakTemperature: nil, gpuPeakTemperature: nil,
-                hottestSensorTemperature: nil, thermalState: Self.thermalStateName(),
-                targetCoolingLevel: nil, fans: [], temperatures: [:],
-                hardwareInfo: fanController.hardwareInfo, lastError: lastError
+                controlTemperature: nil,
+                cpuPeakTemperature: Self.peak(temperatures, prefixes: ["TC", "Tp"]),
+                gpuPeakTemperature: Self.peak(temperatures, prefixes: ["TG", "Tg"]),
+                hottestSensorTemperature: temperatures.values.max(), thermalState: Self.thermalStateName(),
+                targetCoolingLevel: nil, fans: fans, temperatures: temperatures,
+                hardwareInfo: fanController.hardwareInfo, lastError: lastError,
+                recoveryRequired: recoveryRequired
             )
         }
     }
 
-    private func apply(level: Double) throws {
+    private func apply(level: Double) throws -> Bool {
         let clamped = min(max(level, 0), 1)
         let needsRefresh = Date().timeIntervalSince(lastApplyDate) >= 10
         if lastAppliedLevel == nil || abs((lastAppliedLevel ?? 0) - clamped) >= 0.025 || needsRefresh {
@@ -336,7 +442,9 @@ final class ControllerRuntime {
             }
             lastAppliedLevel = clamped
             lastApplyDate = Date()
+            return true
         }
+        return false
     }
 
     private func makeStatus(
@@ -356,7 +464,8 @@ final class ControllerRuntime {
             fans: raw.fans,
             temperatures: raw.temperatures,
             hardwareInfo: fanController.hardwareInfo,
-            lastError: error ?? lastError
+            lastError: error ?? lastError,
+            recoveryRequired: recoveryRequired
         )
     }
 

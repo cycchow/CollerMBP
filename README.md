@@ -78,11 +78,13 @@ sudo coolermbpctl auto
 
 ## Emergency recovery
 
-The independent root SMC tool does not depend on the daemon/XPC path:
+Try the daemon-supervised restore first. If it times out or cannot respond, the recovery helper disables and requests daemon shutdown, waits up to 20 seconds for the service to unload and the writer lock to become available, then runs and verifies the standalone restore:
 
 ```bash
-sudo /usr/local/sbin/coolermbpsmc auto
+sudo /usr/local/sbin/coolermbp-recover
 ```
+
+The standalone tool is read-only except for explicit recovery commands; use `coolermbpctl max` for maximum cooling while the daemon is available.
 
 If status reports active Ftst with unknown ownership, `auto` deliberately refuses to clear it. After stopping other fan-control tools and deciding to return control to macOS, the explicit administrative recovery is:
 
@@ -127,14 +129,14 @@ The code deliberately:
 - restores Apple control and latches Apple Automatic if temperature acquisition/control fails;
 - verifies mode/target writes and checks that fan RPM responds;
 - accepts daemon connections only from the installed, root-owned app and root-only CLI;
-- provides a daemon-independent `sudo coolermbpsmc auto` recovery path.
+- provides daemon-first recovery with a bounded, lock-checked standalone fallback through `sudo coolermbp-recover`.
 - records when it enabled `Ftst`, restores only an owned override, and reports active unknown ownership as recovery required;
 - reconciles fan modes and owned `Ftst` state at daemon startup before honoring any saved cooling mode; after a crash, restart begins in Apple Automatic;
 - provides read-only sensor inspection through `coolermbpsmc status`.
 
 Even with these safeguards, manual SMC fan control can interfere with Apple's thermal management. Test it while monitoring temperatures before relying on it unattended.
 
-If status reports active `Ftst` with unknown ownership, do not force `Ftst=0` blindly. Stop competing fan tools and use the explicit `coolermbpsmc auto` command only after deciding that returning control to macOS is appropriate. If that command cannot verify the result, retain the recovery metadata and inspect `/var/log/CoolerMBP.log` before any manual SMC intervention. SIGKILL, crashes, sleep, and power loss can interrupt transitions; the next daemon start attempts reconciliation.
+If status reports active `Ftst` with unknown ownership, do not force `Ftst=0` blindly. The ordinary recovery command blocks before any SMC write. Stop competing fan tools, decide that returning control to macOS is appropriate, then use `sudo /usr/local/sbin/coolermbpsmc recover-unknown-ftst`. If recovery cannot verify the result, the helper leaves the daemon disabled and retains recovery metadata. SIGKILL, crashes, sleep, and power loss can interrupt transitions; the next daemon start attempts reconciliation.
 
 For diagnostic logs, collect `sudo coolermbpctl status`, `sudo coolermbpsmc status`, and `sudo tail -100 /var/log/CoolerMBP.log`. For an external CPU/thermal sample, run `sudo powermetrics --samplers cpu_power,thermal` in a separate terminal. Compare repeated workloads using application throughput and completion time as primary measures; frequency and utilization alone do not identify effective work or prove a thermal cause. Record model, macOS build, power mode, workload, ambient conditions, and whether CoolerMBP was enabled.
 
