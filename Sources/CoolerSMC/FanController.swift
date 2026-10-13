@@ -36,8 +36,11 @@ public struct RawThermalStatus {
 
 public final class FanController {
     private let smc: any SMCTransport
-    private let modeKeyTemplate: String
-    private let hasFtst: Bool
+    private let recoveryURL: URL?
+    private let writeEnabled: Bool
+    private var ownsFtst: Bool
+    private var manualStrategy = "notApplicable"
+    private var lastTransitionDate: Date?
 
     private static let fanCountKey = "FNum"
     private static let forceTestKey = "Ftst"
@@ -61,25 +64,41 @@ public final class FanController {
 
     private static let ioftTemperatureKeys = ["TG0B", "TG0H", "TG0V"]
 
-    public init() throws {
+    public init(writeEnabled: Bool = true) throws {
         guard let connection = SMCConnection() else { throw FanControllerError.connectionFailed }
         self.smc = connection
-
-        let lowerKey = Self.key(Self.modeLowerTemplate, fan: 0)
-        self.modeKeyTemplate = smc.readKey(lowerKey).success ? Self.modeLowerTemplate : Self.modeUpperTemplate
-        self.hasFtst = (smc.getKeyInfo(Self.forceTestKey)?.size ?? 0) > 0
+        self.writeEnabled = writeEnabled
+        self.recoveryURL = URL(fileURLWithPath: "/Library/Application Support/CoolerMBP/recovery.json")
+        self.ownsFtst = Self.readOwnership(from: recoveryURL)
     }
 
-    init(smc: any SMCTransport) {
+    init(smc: any SMCTransport, recoveryURL: URL? = nil, writeEnabled: Bool = true) {
         self.smc = smc
-
-        let lowerKey = Self.key(Self.modeLowerTemplate, fan: 0)
-        self.modeKeyTemplate = smc.readKey(lowerKey).success ? Self.modeLowerTemplate : Self.modeUpperTemplate
-        self.hasFtst = (smc.getKeyInfo(Self.forceTestKey)?.size ?? 0) > 0
+        self.recoveryURL = recoveryURL
+        self.writeEnabled = writeEnabled
+        self.ownsFtst = Self.readOwnership(from: recoveryURL)
     }
 
     public var hardwareInfo: String {
-        "Ftst=\(hasFtst ? "available" : "unavailable"), modeKey=\(modeKeyTemplate)"
+        let ftst = smc.readKey(Self.forceTestKey)
+        let value = ftst.success && ftst.bytes.count == 1 ? String(ftst.bytes[0]) : "unreadable"
+        let transition = lastTransitionDate.map { ISO8601DateFormatter().string(from: $0) } ?? "none"
+        let ownership = ftstOwnership
+        let recoveryRequired = ownership == "unknown" || ownership == "unreadable" || ftstAvailability == "unsupported-format"
+        return "Ftst=\(ftstAvailability):\(value), ownership=\(ownership), strategy=\(manualStrategy), lastTransition=\(transition), recoveryRequired=\(recoveryRequired)"
+    }
+
+    public var ftstAvailability: String {
+        guard let info = smc.getKeyInfo(Self.forceTestKey) else { return "unavailable" }
+        return info.size == 1 && info.type == "ui8 " ? "available" : "unsupported-format"
+    }
+
+    public var ftstOwnership: String {
+        guard ftstAvailability == "available" else { return "unavailable" }
+        let result = smc.readKey(Self.forceTestKey)
+        guard result.success, result.size == 1, result.type == "ui8 ", result.bytes.count == 1 else { return "unreadable" }
+        if result.bytes[0] == 0 { return "inactive" }
+        return ownsFtst ? "owned" : "unknown"
     }
 
     public func status() throws -> RawThermalStatus {
@@ -92,14 +111,14 @@ public final class FanController {
         var temperatures: [String: Double] = [:]
         for key in Self.floatTemperatureKeys {
             let result = smc.readKey(key)
-            guard result.success, result.size == 4 else { continue }
+            guard result.success, result.size == 4, result.type == "flt ", result.bytes.count == 4 else { continue }
             let value = Double(Self.floatValue(result.bytes))
             if value > 0, value < 150 { temperatures[key] = (value * 10).rounded() / 10 }
         }
 
         for key in Self.ioftTemperatureKeys {
             let result = smc.readKey(key)
-            guard result.success, result.size == 8 else { continue }
+            guard result.success, result.size == 8, result.type == "ioft", result.bytes.count == 8 else { continue }
             let value = Double(Self.ioftValue(result.bytes))
             if value > 0, value < 150 { temperatures[key] = (value * 10).rounded() / 10 }
         }
@@ -108,6 +127,10 @@ public final class FanController {
     }
 
     public func setCoolingLevel(_ level: Double) throws {
+        guard writeEnabled else { throw FanControllerError.writeFailed("SMC writer lock unavailable; controller is read-only") }
+        if ftstOwnership == "unknown" || ftstOwnership == "unreadable" {
+            throw FanControllerError.unlockFailed("Ftst is active with unknown ownership or unreadable state")
+        }
         let clamped = min(max(level, 0), 1)
         let count = try fanCount()
         let infos = try (0..<count).map(fanInfo)
@@ -118,7 +141,8 @@ public final class FanController {
 
         do {
             if infos.contains(where: { $0.mode != "manual" }) {
-                try unlockFans(count: count)
+                logEvent("manual_request", "level=\(clamped)")
+                try enterManualMode(infos)
             }
 
             let targets = infos.map { fan -> (fan: FanReading, key: String, rpm: Int, bytes: [UInt8]) in
@@ -131,7 +155,7 @@ public final class FanController {
                 let deadline = Date().addingTimeInterval(2)
                 var written = false
                 repeat {
-                    if smc.writeKey(target.key, bytes: target.bytes) {
+                    if smc.writeKey(target.key, bytes: target.bytes).success {
                         written = true
                         break
                     }
@@ -139,8 +163,10 @@ public final class FanController {
                 } while Date() < deadline
                 guard written else {
                     let key = target.key
+                    logEvent("target_write_failed", "key=\(key)")
                     throw FanControllerError.writeFailed(key)
                 }
+                logEvent("target_written", "key=\(target.key) rpm=\(target.rpm)")
             }
 
             var pending = targets
@@ -173,18 +199,26 @@ public final class FanController {
         try setCoolingLevel(1.0)
     }
 
-    public func resetAppleAutomatic() throws {
+    public func resetAppleAutomatic(allowUnknownFtstRelease: Bool = false) throws {
+        guard writeEnabled else { throw FanControllerError.recoveryFailed(["SMC writer lock unavailable; controller is read-only"]) }
         let count = try fanCount()
         var failures: [String] = []
+        var reconciliationNeeded = false
+        var changedFanMode = false
         for index in 0..<count {
-            let modeKey = Self.key(modeKeyTemplate, fan: index)
-            if !smc.writeKey(modeKey, bytes: [0]) { failures.append(modeKey) }
-        }
-        if hasFtst {
-            if !smc.writeKey(Self.forceTestKey, bytes: [0]) { failures.append(Self.forceTestKey) }
+            do {
+                let modeKey = try modeKey(for: index)
+                let state = try fanInfo(index)
+                if state.mode != "auto" && state.mode != "system" {
+                    reconciliationNeeded = true
+                    logEvent("automatic_restore_requested", "fan=\(index) mode=\(state.mode)")
+                    let result = smc.writeKey(modeKey, bytes: [0])
+                    if !result.success { failures.append("\(modeKey) write rejected (kernel=\(String(describing: result.kernelReturn)), firmware=\(String(describing: result.firmwareResult)))") }
+                    else { changedFanMode = true }
+                }
+            } catch { failures.append("fan \(index): \(error)") }
         }
         for index in 0..<count {
-            let modeKey = Self.key(modeKeyTemplate, fan: index)
             let deadline = Date().addingTimeInterval(2)
             var restored = false
             repeat {
@@ -193,14 +227,61 @@ public final class FanController {
                     restored = true
                     break
                 }
-                _ = smc.writeKey(modeKey, bytes: [0])
                 Thread.sleep(forTimeInterval: 0.1)
             } while Date() < deadline
             if !restored { failures.append("fan \(index) mode verification") }
         }
+        if ftstAvailability == "available" {
+            let ftst = smc.readKey(Self.forceTestKey)
+            guard ftst.success, ftst.size == 1, ftst.type == "ui8 ", ftst.bytes.count == 1 else {
+                failures.append("Ftst ownership cannot be verified")
+                throw FanControllerError.recoveryFailed(failures)
+            }
+            var verifyFtstReleased = ftst.bytes[0] == 0 || ownsFtst
+            if ftst.bytes[0] == 1 && !ownsFtst {
+                reconciliationNeeded = true
+                if allowUnknownFtstRelease {
+                    logEvent("explicit_unknown_ftst_recovery", "admin_requested=true")
+                    let result = smc.writeKey(Self.forceTestKey, bytes: [0])
+                    verifyFtstReleased = true
+                    if !result.success { failures.append("explicit Ftst release rejected") }
+                } else {
+                    failures.append("Ftst is active with unknown ownership")
+                }
+            } else if ftst.bytes[0] == 1 {
+                reconciliationNeeded = true
+                logEvent("automatic_restore_requested", "releasing_owned_ftst=true")
+                let result = smc.writeKey(Self.forceTestKey, bytes: [0])
+                if !result.success { failures.append("Ftst release rejected") }
+            }
+            if verifyFtstReleased {
+                let verify = smc.readKey(Self.forceTestKey)
+                if !verify.success || verify.size != 1 || verify.type != "ui8 " || verify.bytes != [0] {
+                    failures.append("Ftst release verification")
+                } else if ownsFtst {
+                    do {
+                        try persistOwnership(false)
+                        ownsFtst = false
+                        manualStrategy = "notApplicable"
+                        lastTransitionDate = Date()
+                        logEvent("ftst_released", "verified=0 owner=CoolerMBP")
+                    } catch { failures.append("recovery metadata: \(error)") }
+                } else {
+                    // A zero flag that CoolerMBP did not set needs no ownership mutation.
+                }
+            }
+        } else if ownsFtst {
+            failures.append("Ftst was previously owned but is now unavailable")
+        }
         if !failures.isEmpty {
+            logEvent("automatic_restore_failed", failures.joined(separator: ";"))
             throw FanControllerError.recoveryFailed(failures)
         }
+        if changedFanMode {
+            manualStrategy = "notApplicable"
+            lastTransitionDate = Date()
+        }
+        if reconciliationNeeded { logEvent("automatic_restore_verified", "fans=\(count), ftst=\(ftstOwnership)") }
     }
 
     public static func verifyFanResponse(_ fans: [FanReading]) throws {
@@ -214,9 +295,10 @@ public final class FanController {
 
     private func fanCount() throws -> Int {
         let result = smc.readKey(Self.fanCountKey)
-        guard result.success, let first = result.bytes.first else {
+        guard result.success, result.size == 1, result.type == "ui8 ", result.bytes.count == 1 else {
             throw FanControllerError.readFailed(Self.fanCountKey)
         }
+        let first = result.bytes[0]
         let count = Int(first)
         guard count > 0 else { throw FanControllerError.noFans }
         guard count <= 10 else { throw FanControllerError.invalidFanCount(count) }
@@ -228,9 +310,15 @@ public final class FanController {
         let target = readFanFloat(index, template: Self.targetTemplate)
         let minimum = readFanFloat(index, template: Self.minTemplate)
         let maximum = readFanFloat(index, template: Self.maxTemplate)
-        let modeKey = Self.key(modeKeyTemplate, fan: index)
+        let modeKey = try modeKey(for: index)
+        guard [actual, target, minimum, maximum].allSatisfy(\.isFinite) else {
+            throw FanControllerError.readFailed("fan \(index) RPM keys (invalid type, size, or value)")
+        }
         let modeResult = smc.readKey(modeKey)
-        let modeValue = modeResult.success ? (modeResult.bytes.first ?? 255) : 255
+        guard modeResult.success, modeResult.size == 1, modeResult.type == "ui8 ", modeResult.bytes.count == 1 else {
+            throw FanControllerError.readFailed(modeKey)
+        }
+        let modeValue = modeResult.bytes[0]
         let mode: String
         switch modeValue {
         case 0: mode = "auto"
@@ -245,39 +333,107 @@ public final class FanController {
             targetRPM: Int(target.rounded()),
             minRPM: Int(minimum.rounded()),
             maxRPM: Int(maximum.rounded()),
-            mode: mode
+            mode: mode,
+            modeKey: modeKey
         )
     }
 
-    private func unlockFans(count: Int) throws {
-        if hasFtst {
-            guard smc.writeKey(Self.forceTestKey, bytes: [1]) else {
-                throw FanControllerError.unlockFailed("Ftst=1 was rejected")
-            }
-            Thread.sleep(forTimeInterval: 0.5)
-        }
-
-        for index in 0..<count {
-            let modeKey = Self.key(modeKeyTemplate, fan: index)
-            let deadline = Date().addingTimeInterval(8)
-            var succeeded = false
-            while Date() < deadline {
-                if smc.writeKey(modeKey, bytes: [1]) {
-                    succeeded = true
-                    break
+    private func enterManualMode(_ fans: [FanReading]) throws {
+        for fan in fans where fan.mode != "manual" {
+            let key = try modeKey(for: fan.index)
+            let direct = smc.writeKey(key, bytes: [1])
+            if direct.success {
+                guard (try? fanInfo(fan.index).mode) == "manual" else {
+                    throw FanControllerError.unlockFailed("\(key) write accepted but mode readback did not become manual")
                 }
-                Thread.sleep(forTimeInterval: 0.1)
+                manualStrategy = "direct"
+                lastTransitionDate = Date()
+                logEvent("direct_mode_verified", "fan=\(fan.index) key=\(key)")
+                continue
             }
-            guard succeeded else {
-                throw FanControllerError.unlockFailed("Timed out switching fan \(index) to manual mode")
+            logEvent("direct_mode_rejected", "fan=\(fan.index) key=\(key) kernel=\(String(describing: direct.kernelReturn)) firmware=\(String(describing: direct.firmwareResult))")
+            // The reverse-engineered Ftst path is only relevant when firmware
+            // reports system-managed mode and rejects a direct mode write.
+            guard fan.mode == "system", direct.kernelReturn == nil,
+                  direct.firmwareResult == 0x82, ftstAvailability == "available" else {
+                throw FanControllerError.unlockFailed("Direct \(key)=1 rejected (kernel=\(String(describing: direct.kernelReturn)), firmware=\(String(describing: direct.firmwareResult)))")
             }
+            try enableOwnedFtst()
+            logEvent("ftst_fallback_attempt", "fan=\(fan.index)")
+            manualStrategy = "ftstFallback"
+            let deadline = Date().addingTimeInterval(6)
+            var entered = false
+            repeat {
+                let current = try fanInfo(fan.index)
+                if current.mode == "manual" { entered = true; break }
+                if current.mode == "auto" {
+                    let result = smc.writeKey(key, bytes: [1])
+                    if result.success, (try? fanInfo(fan.index).mode) == "manual" { entered = true; break }
+                }
+                Thread.sleep(forTimeInterval: 0.2)
+            } while Date() < deadline
+            guard entered else { throw FanControllerError.unlockFailed("Ftst fallback did not transition fan \(fan.index) to manual mode") }
+            lastTransitionDate = Date()
         }
+    }
+
+    private func enableOwnedFtst() throws {
+        guard ftstAvailability == "available" else { throw FanControllerError.unlockFailed("Ftst unavailable") }
+        let state = smc.readKey(Self.forceTestKey)
+        guard state.success, state.size == 1, state.type == "ui8 ", state.bytes.count == 1 else {
+            throw FanControllerError.unlockFailed("Ftst state unreadable or has unsupported type")
+        }
+        if state.bytes[0] == 1 {
+            guard ownsFtst else { throw FanControllerError.unlockFailed("Ftst is active with unknown ownership") }
+            return
+        }
+        guard state.bytes[0] == 0, recoveryURL != nil else {
+            throw FanControllerError.unlockFailed("Ftst inactive state or durable recovery storage unavailable")
+        }
+        try persistOwnership(true)
+        ownsFtst = true
+        let result = smc.writeKey(Self.forceTestKey, bytes: [1])
+        guard result.success else { throw FanControllerError.unlockFailed("Ftst=1 rejected (kernel=\(String(describing: result.kernelReturn)), firmware=\(String(describing: result.firmwareResult)))") }
+        Thread.sleep(forTimeInterval: 0.5)
+        let verify = smc.readKey(Self.forceTestKey)
+        guard verify.success, verify.size == 1, verify.type == "ui8 ", verify.bytes == [1] else {
+            throw FanControllerError.unlockFailed("Ftst=1 readback failed")
+        }
+        logEvent("ftst_enabled", "owner=CoolerMBP")
+    }
+
+    private func modeKey(for index: Int) throws -> String {
+        for template in [Self.modeUpperTemplate, Self.modeLowerTemplate] {
+            let key = Self.key(template, fan: index)
+            guard let info = smc.getKeyInfo(key), info.size == 1, info.type == "ui8 " else { continue }
+            return key
+        }
+        throw FanControllerError.readFailed("F\(index)Md/F\(index)md (unsupported or unavailable)")
+    }
+
+    private func persistOwnership(_ owned: Bool) throws {
+        guard let recoveryURL else { throw FanControllerError.unlockFailed("durable recovery path unavailable") }
+        let directory = recoveryURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let data = try JSONEncoder().encode(RecoveryMetadata(ownsFtst: owned))
+        try data.write(to: recoveryURL, options: .atomic)
+    }
+
+    private static func readOwnership(from url: URL?) -> Bool {
+        guard let url, let data = try? Data(contentsOf: url),
+              let metadata = try? JSONDecoder().decode(RecoveryMetadata.self, from: data) else { return false }
+        return metadata.ownsFtst
     }
 
     private func readFanFloat(_ fan: Int, template: String) -> Float {
         let result = smc.readKey(Self.key(template, fan: fan))
-        guard result.success, result.size == 4 else { return 0 }
-        return Self.floatValue(result.bytes)
+        guard result.success, result.size == 4, result.type == "flt ", result.bytes.count == 4 else { return .nan }
+        let value = Self.floatValue(result.bytes)
+        return value.isFinite && value >= 0 && value < 100_000 ? value : .nan
+    }
+
+    private func logEvent(_ event: String, _ detail: String) {
+        fputs("CoolerMBP: event=\(event) \(detail)\n", stderr)
     }
 
     private static func key(_ template: String, fan: Int) -> String {
@@ -306,4 +462,8 @@ public final class FanController {
         }
         return Float(raw >> 16) + Float(raw & 0xffff) / 65536.0
     }
+}
+
+private struct RecoveryMetadata: Codable {
+    let ownsFtst: Bool
 }

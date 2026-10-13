@@ -9,7 +9,9 @@ public enum TemperatureControl {
 
     private static func matching(_ temperatures: [String: Double], prefixes: [String]) -> [Double] {
         temperatures.compactMap { key, value in
-            prefixes.contains(where: { key.hasPrefix($0) }) ? value : nil
+            guard prefixes.contains(where: { key.hasPrefix($0) }),
+                  value.isFinite, value > 0, value < 150 else { return nil }
+            return value
         }
     }
 

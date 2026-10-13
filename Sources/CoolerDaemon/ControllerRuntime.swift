@@ -4,6 +4,7 @@ import CoolerSMC
 
 final class ControllerRuntime {
     private let queue = DispatchQueue(label: "com.superstring.CoolerMBP.controller")
+    private let writerLock: SMCWriterLock?
     private let fanController: FanController
     private let policy = CoolingPolicy()
     private var timer: DispatchSourceTimer?
@@ -31,6 +32,7 @@ final class ControllerRuntime {
     private var missingSensorPolls = 0
     private var lastValidControlTemperature: Double?
     private var fanResponseFailurePolls = 0
+    private var recoveryRequired = false
 
     // A transient SMC sensor gap should not immediately drop manual fan control.
     private static let missingSensorPollLimit = 3
@@ -40,7 +42,8 @@ final class ControllerRuntime {
     private let configURL = URL(fileURLWithPath: "/Library/Application Support/CoolerMBP/config.json")
 
     init() throws {
-        fanController = try FanController()
+        writerLock = try? SMCWriterLock()
+        fanController = try FanController(writeEnabled: writerLock != nil)
         config = Self.loadConfig(from: configURL) ?? DaemonConfig()
         cachedStatus = DaemonStatus(
             timestamp: Date(), mode: config.mode,
@@ -53,7 +56,18 @@ final class ControllerRuntime {
 
     func start() {
         queue.async { [self] in
-            self.tick()
+            do {
+                // Never resume a persisted manual request before reconciling
+                // hardware state left by a previous daemon instance.
+                try self.fanController.resetAppleAutomatic()
+                try self.latchAppleAutomatic()
+                self.lastError = nil
+                self.tick()
+            } catch {
+                self.lastError = "Startup recovery required: \(error)"
+                self.recoveryRequired = true
+                self.recordSafetyFallback(self.lastError!)
+            }
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
             timer.schedule(deadline: .now() + 2, repeating: 2)
             timer.setEventHandler { [weak self] in self?.tick() }
@@ -73,10 +87,14 @@ final class ControllerRuntime {
 
     func setMode(_ mode: CoolingMode, completion: @escaping (Result<Void, Error>) -> Void) {
         queue.async {
+            let previous = self.config
             do {
+                if self.recoveryRequired && mode != .appleAuto {
+                    throw RuntimeTransitionError.failed("Recovery is required; manual modes are disabled")
+                }
+                if mode == .appleAuto { self.recoveryRequired = false }
                 var candidate = self.config
                 candidate.mode = mode
-                try self.saveConfig(candidate)
                 self.config = candidate
                 self.lastAppliedLevel = nil
                 self.lastApplyDate = .distantPast
@@ -87,8 +105,27 @@ final class ControllerRuntime {
                 self.fanResponseFailurePolls = 0
                 self.lastError = nil
                 self.tick()
+                if let error = self.lastError {
+                    throw RuntimeTransitionError.failed(error)
+                }
+                do {
+                    try self.saveConfig(candidate)
+                } catch {
+                    let persistenceError = error
+                    do {
+                        try self.fanController.resetAppleAutomatic()
+                        try self.latchAppleAutomatic()
+                    } catch {
+                        throw RuntimeTransitionError.failed("Unable to persist requested mode (\(persistenceError)); automatic recovery failed: \(error)")
+                    }
+                    throw RuntimeTransitionError.failed("Unable to persist requested mode: \(persistenceError)")
+                }
+                self.config = candidate
                 completion(.success(()))
             } catch {
+                if self.config.mode != .appleAuto {
+                    self.config = previous
+                }
                 completion(.failure(error))
             }
         }
@@ -100,8 +137,45 @@ final class ControllerRuntime {
     }
 
     private func tick() {
+        if recoveryRequired {
+            do {
+                let raw = try fanController.status()
+                latestStatus = DaemonStatus(
+                    timestamp: Date(), mode: config.mode,
+                    controlTemperature: nil, cpuPeakTemperature: Self.peak(raw.temperatures, prefixes: ["TC", "Tp"]),
+                    gpuPeakTemperature: Self.peak(raw.temperatures, prefixes: ["TG", "Tg"]),
+                    hottestSensorTemperature: raw.temperatures.values.max(), thermalState: Self.thermalStateName(),
+                    targetCoolingLevel: nil, fans: raw.fans, temperatures: raw.temperatures,
+                    hardwareInfo: fanController.hardwareInfo, lastError: lastError
+                )
+            } catch { lastError = "Recovery required; read-only status failed: \(error)" }
+            return
+        }
         do {
             let raw = try fanController.status()
+            if let applied = lastAppliedLevel,
+               raw.fans.contains(where: { fan in
+                   let expected = Double(fan.minRPM) + applied * Double(fan.maxRPM - fan.minRPM)
+                   return fan.mode != "manual" || abs(Double(fan.targetRPM) - expected) > 150
+               }) {
+                let message = "Fan mode or target changed outside CoolerMBP; control paused for recovery."
+                fputs("CoolerMBP: event=unexpected_fan_state_change action=pause_control\n", stderr)
+                lastAppliedLevel = nil
+                manualSince = nil
+                recoveryRequired = true
+                lastError = message
+                do { try latchAppleAutomatic() }
+                catch { lastError = "\(message) Unable to persist Apple Automatic: \(error)" }
+                latestStatus = DaemonStatus(
+                    timestamp: Date(), mode: config.mode,
+                    controlTemperature: nil, cpuPeakTemperature: Self.peak(raw.temperatures, prefixes: ["TC", "Tp"]),
+                    gpuPeakTemperature: Self.peak(raw.temperatures, prefixes: ["TG", "Tg"]),
+                    hottestSensorTemperature: raw.temperatures.values.max(), thermalState: Self.thermalStateName(),
+                    targetCoolingLevel: nil, fans: raw.fans, temperatures: raw.temperatures,
+                    hardwareInfo: fanController.hardwareInfo, lastError: lastError
+                )
+                return
+            }
             if lastAppliedLevel != nil,
                let manualSince,
                Date().timeIntervalSince(manualSince) >= Self.fanResponseVerificationDelay {
@@ -130,9 +204,7 @@ final class ControllerRuntime {
                 missingSensorPolls = 0
                 lastValidControlTemperature = nil
                 fanResponseFailurePolls = 0
-                if lastAppliedLevel != nil || raw.fans.contains(where: { $0.mode == "manual" }) {
-                    try fanController.resetAppleAutomatic()
-                }
+                try fanController.resetAppleAutomatic()
                 lastAppliedLevel = nil
                 belowReleaseSince = nil
                 manualSince = nil
@@ -223,10 +295,19 @@ final class ControllerRuntime {
             let operationError = String(describing: error)
             lastError = operationError
             // Failure to read/control sensors is safer when macOS regains authority.
-            do { try fanController.resetAppleAutomatic() }
-            catch { lastError = "\(operationError); recovery failed: \(error)" }
-            do { try latchAppleAutomatic() }
-            catch { lastError = "\(lastError ?? operationError); unable to persist safety mode: \(error)" }
+            var restored = false
+            do {
+                try fanController.resetAppleAutomatic()
+                restored = true
+                recoveryRequired = false
+            } catch {
+                recoveryRequired = true
+                lastError = "\(operationError); recovery failed: \(error)"
+            }
+            if restored {
+                do { try latchAppleAutomatic() }
+                catch { lastError = "\(lastError ?? operationError); unable to persist safety mode: \(error)" }
+            }
             lastAppliedLevel = nil
             manualSince = nil
             missingSensorPolls = 0
@@ -316,6 +397,16 @@ final class ControllerRuntime {
         case .serious: return "serious"
         case .critical: return "critical"
         @unknown default: return "unknown"
+        }
+    }
+}
+
+private enum RuntimeTransitionError: Error, CustomStringConvertible {
+    case failed(String)
+
+    var description: String {
+        switch self {
+        case .failed(let detail): return "Hardware transition failed: \(detail)"
         }
     }
 }

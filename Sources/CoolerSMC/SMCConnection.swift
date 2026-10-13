@@ -3,8 +3,14 @@ import IOKit
 
 protocol SMCTransport: AnyObject {
     func readKey(_ key: String) -> (success: Bool, bytes: [UInt8], size: UInt32, type: String)
-    func writeKey(_ key: String, bytes: [UInt8]) -> Bool
+    func writeKey(_ key: String, bytes: [UInt8]) -> SMCWriteResult
     func getKeyInfo(_ key: String) -> (size: UInt32, type: String)?
+}
+
+struct SMCWriteResult {
+    let success: Bool
+    let kernelReturn: Int32?
+    let firmwareResult: UInt8?
 }
 
 // AppleSMC userspace structure/command interface.
@@ -117,24 +123,34 @@ public final class SMCConnection {
         return (true, bytes, dataSize, dataType)
     }
 
-    public func writeKey(_ key: String, bytes: [UInt8]) -> Bool {
-        guard bytes.count <= 32 else { return false }
+    func writeKey(_ key: String, bytes: [UInt8]) -> SMCWriteResult {
+        guard key.utf8.count == 4, bytes.count <= 32 else {
+            return SMCWriteResult(success: false, kernelReturn: nil, firmwareResult: nil)
+        }
 
         var input = SMCParamStruct()
         var output = SMCParamStruct()
         input.key = fourCharCode(key)
         input.data8 = SMCCommand.readKeyInfo.rawValue
 
-        guard callSMC(&input, &output) == kIOReturnSuccess else { return false }
+        let infoResult = callSMC(&input, &output)
+        guard infoResult == kIOReturnSuccess else {
+            return SMCWriteResult(success: false, kernelReturn: Int32(infoResult), firmwareResult: nil)
+        }
         let size = Int(output.keyInfo.dataSize)
-        guard size > 0, size <= 32, bytes.count <= size else { return false }
+        guard size > 0, size <= 32, bytes.count == size else {
+            return SMCWriteResult(success: false, kernelReturn: nil, firmwareResult: nil)
+        }
 
         input.data8 = SMCCommand.writeBytes.rawValue
         input.keyInfo.dataSize = output.keyInfo.dataSize
         input.bytes = arrayToTuple(bytes)
 
-        guard callSMC(&input, &output) == kIOReturnSuccess else { return false }
-        return output.result == 0
+        let writeResult = callSMC(&input, &output)
+        guard writeResult == kIOReturnSuccess else {
+            return SMCWriteResult(success: false, kernelReturn: Int32(writeResult), firmwareResult: nil)
+        }
+        return SMCWriteResult(success: output.result == 0, kernelReturn: nil, firmwareResult: output.result)
     }
 
     public func getKeyInfo(_ key: String) -> (size: UInt32, type: String)? {

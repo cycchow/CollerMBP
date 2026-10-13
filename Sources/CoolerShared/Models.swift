@@ -21,14 +21,16 @@ public struct FanReading: Codable, Hashable, Sendable {
     public let minRPM: Int
     public let maxRPM: Int
     public let mode: String
+    public let modeKey: String?
 
-    public init(index: Int, actualRPM: Int, targetRPM: Int, minRPM: Int, maxRPM: Int, mode: String) {
+    public init(index: Int, actualRPM: Int, targetRPM: Int, minRPM: Int, maxRPM: Int, mode: String, modeKey: String? = nil) {
         self.index = index
         self.actualRPM = actualRPM
         self.targetRPM = targetRPM
         self.minRPM = minRPM
         self.maxRPM = maxRPM
         self.mode = mode
+        self.modeKey = modeKey
     }
 }
 

@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import CoolerShared
 
 final class Client {
@@ -27,11 +28,19 @@ final class Client {
                 let decoder = JSONDecoder()
                 decoder.dateDecodingStrategy = .iso8601
                 let status = try decoder.decode(DaemonStatus.self, from: data as Data)
+                print("hardware: \(self.hardwareModel())")
+                print("macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)")
                 print("mode: \(status.mode.rawValue)")
-                if let t = status.controlTemperature { print(String(format: "control temp: %.1f C", t)) }
+                print("verified fan-control: \(status.fans.map(\.mode).joined(separator: ", "))")
                 print("thermal state: \(status.thermalState)")
+                print("SMC: \(status.hardwareInfo)")
+                if let t = status.controlTemperature { print(String(format: "control temp: %.1f C", t)) }
+                if let t = status.cpuPeakTemperature { print(String(format: "CPU peak: %.1f C", t)) }
+                if let t = status.gpuPeakTemperature { print(String(format: "GPU peak: %.1f C", t)) }
+                if let t = status.hottestSensorTemperature { print(String(format: "hotspot: %.1f C", t)) }
+                if let target = status.targetCoolingLevel { print(String(format: "target cooling: %.0f%%", target * 100)) }
                 for fan in status.fans {
-                    print("fan \(fan.index): \(fan.actualRPM) rpm (target \(fan.targetRPM), \(fan.mode), range \(fan.minRPM)-\(fan.maxRPM))")
+                    print("fan \(fan.index): \(fan.actualRPM) rpm (target \(fan.targetRPM), \(fan.mode), key \(fan.modeKey ?? "unknown"), range \(fan.minRPM)-\(fan.maxRPM))")
                 }
                 if let err = status.lastError { print("last error: \(err)") }
                 exitCode = 0
@@ -88,6 +97,14 @@ final class Client {
             onError()
         } as? CoolerDaemonXPCProtocol
     }
+
+    private func hardwareModel() -> String {
+        var size = 0
+        guard sysctlbyname("hw.model", nil, &size, nil, 0) == 0, size > 0 else { return "unknown" }
+        var value = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("hw.model", &value, &size, nil, 0) == 0 else { return "unknown" }
+        return String(cString: value)
+    }
 }
 
 let args = CommandLine.arguments.dropFirst()
@@ -95,13 +112,13 @@ let command = args.first ?? "status"
 let client = Client()
 let code: Int32
 switch command {
-case "status": code = client.status()
+case "status", "diagnose": code = client.status()
 case "ping": code = client.ping()
 case "auto", "reset": code = client.setMode(.appleAuto)
 case "cool": code = client.setMode(.coolSurface)
 case "max": code = client.setMode(.maximum)
 default:
-    print("usage: coolermbpctl [status|ping|auto|cool|max]")
+    print("usage: coolermbpctl [status|diagnose|ping|auto|cool|max]")
     code = 2
 }
 exit(code)

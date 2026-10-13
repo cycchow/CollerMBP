@@ -35,6 +35,11 @@ final class CoolingPolicyTests: XCTestCase {
         XCTAssertEqual(TemperatureControl.representative(from: temperatures) ?? -1, 65.0, accuracy: 0.001)
     }
 
+    func testInvalidAndMissingTemperatureSensorsAreIgnored() {
+        XCTAssertNil(TemperatureControl.representative(from: ["Tp01": .nan, "Tg05": 0, "TCMb": 150]))
+        XCTAssertEqual(TemperatureControl.representative(from: ["Tp01": 60, "Tg05": .infinity]) ?? -1, 60, accuracy: 0.001)
+    }
+
     func testTemperatureMovingAverageUsesBoundedWindow() {
         var average = TemperatureMovingAverage(sampleCount: 3)
         _ = average.add(50)
