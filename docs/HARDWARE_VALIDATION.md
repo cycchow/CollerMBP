@@ -1,128 +1,158 @@
 # CoolerMBP hardware validation
 
-This runbook prepares controlled validation on the M2 Pro and M3 Max. Hardware validation is **not complete** until the commands below have been run on each target and the report template is filled with captured output. No procedure here authorizes unattended SMC writes.
+This runbook prepares controlled validation on the M2 Pro and M3 Max. Hardware validation remains **unverified** until the procedures have actually been run on each target and captured in a report. No commands in this document are automated.
 
-## Safety gate
+## Safety rules
 
-- Read-only commands are marked **READ ONLY**. They do not request a mode change.
-- Commands marked **SMC WRITE — explicit operator approval required** can alter fan mode/target or Ftst. Do not run one until the operator has reviewed the proposed command and approved that specific transition. The approval must precede execution.
-- Never run `recover-unknown-ftst` as an automatic step. Do not run unknown-state recovery during this validation unless a human has reviewed the captured state and explicitly approves that specific override.
-- Do not install/uninstall, stress the CPU/GPU, SIGKILL/crash the daemon, change curves, or alter SMC logic as part of the validation.
-- At any stop condition below, stop transitions. Run only the read-only collector, preserve output, and report state. Do not continue to the next step or attempt guessed SMC writes.
+- Read-only commands do not request a mode change. Any command that can change fan mode, fan target, or Ftst is marked **SMC WRITE — explicit operator approval required**. Get approval for each transition before running that command.
+- Keep the operator present during manual mode. Do not run CatBoost, CPU/GPU stress workloads, artificial heating, or cooling-curve changes. Do not crash or SIGKILL the daemon.
+- Do not invoke unknown-ownership recovery automatically. It is outside the normal validation sequence.
+- If a stop criterion occurs, stop transitions. Collect read-only diagnostics, preserve the output, and report the observed state. Do not restart, install, or attempt recovery automatically.
+- Installation/upgrade is permitted only in Phase 1, after safety review and explicit operator approval. It is never part of Phase 0 and is never automatic.
 
-## Commands and write classification
+## Command classification
 
-| Command | Classification | Purpose |
+| Command | Classification | Notes |
 |---|---|---|
-| `sudo coolermbpctl status` | READ ONLY | Daemon mode, persisted mode, fan readings, verification/recovery flags, Ftst and last error. |
-| `sudo coolermbpsmc status` | READ ONLY | Direct SMC readings and Ftst diagnostics, independent of cached daemon status. |
-| `sudo coolermbpctl ping` | READ ONLY | XPC availability only. |
-| `sudo launchctl print system/com.superstring.CoolerMBP.daemon` | READ ONLY | Service state and process details. |
-| `sudo tail -n 300 /var/log/CoolerMBP.log` | READ ONLY | Daemon events and errors. |
-| `sudo scripts/collect-hardware-diagnostics.sh` | READ ONLY with respect to SMC | Captures status/log/state files to a timestamped directory. It writes only its output files. |
-| `sudo coolermbpctl cool` / `auto` | SMC WRITE — explicit approval required | Enter Cool Surface / restore Apple Automatic. |
-| `./install.sh` | SMC WRITE — explicit approval required | Upgrade: builds, requests Automatic, stops/replaces/starts daemon and app. |
-| `sudo launchctl bootout ...` | May cause SMC writes | Graceful daemon termination invokes shutdown recovery. |
-| `sudo /usr/local/sbin/coolermbp-recover` | SMC WRITE — explicit approval required | Daemon-first recovery; may run standalone Apple Automatic recovery. Never force unknown Ftst. |
-| `sudo coolermbpsmc recover-unknown-ftst` | Explicit unknown-Ftst SMC WRITE | Overrides unknown ownership; excluded from automatic procedures. Requires separate human decision/approval. |
+| `sw_vers`, `sysctl`, `test -e`, `launchctl print`, `tail` | READ ONLY | System/hardware inventory and logs. |
+| `sudo coolermbpctl status` | READ ONLY | Daemon state, requested/persisted mode, temperatures, fan readings and verification flags. |
+| `sudo coolermbpsmc status` | READ ONLY | Direct fan and Ftst readings, ownership and latest transition strategy. |
+| `sudo coolermbpctl ping` | READ ONLY | XPC reachability only. |
+| `sudo scripts/collect-hardware-diagnostics.sh` | READ ONLY with respect to SMC | Writes a local diagnostic bundle only; it does not issue a mode/recovery command. |
+| `sudo coolermbpctl cool` | SMC WRITE — explicit operator approval required | Persists Cool Surface. It may enter manual control if policy and thermal conditions require it. |
+| `sudo coolermbpctl max` | SMC WRITE — explicit operator approval required | Requests deterministic maximum fan control and verifies all fans entered manual mode. |
+| `sudo coolermbpctl auto` | SMC WRITE — separate explicit operator approval required | Requests Apple Automatic and verifies hardware readback. |
+| `./install.sh` | INSTALL + SMC WRITE — explicit operator approval required | Builds, stops/replaces/starts services, requests Auto, and may restore fan/Ftst state. See the installer constraint below. |
+| `sudo launchctl bootout ...` | May cause SMC writes | Graceful daemon shutdown calls its restoration handler. Restart only in Phase 6. |
+| `sudo /usr/local/sbin/coolermbp-recover` | SMC WRITE — explicit operator approval required | Daemon-first Apple Automatic recovery; never treats unknown Ftst ownership as approved. |
+| `coolermbpsmc recover-unknown-ftst` | Explicit unknown-Ftst SMC WRITE | Not part of the automated or normal validation procedure. Requires separate review and approval. |
 
-`coolermbpsmc status` reports `Ftst=available` or `unavailable` (or an uncertain read/format result), its value, ownership, the latest transition strategy, and recovery status. `strategy=notApplicable` before/after manual control is expected; `direct` and `ftstFallback` identify a successful manual path. Ftst availability alone does not prove it was written.
+`coolermbpsmc status` reports Ftst availability/value/ownership and the last SMC strategy. `direct` and `ftstFallback` identify the strategy used by a successful manual transition; `notApplicable` is expected before/after manual control. Availability by itself does not mean Ftst was written.
 
-## Read-only collection
+## PHASE 0 — Read-only machine inventory
 
-From this source checkout, run before and after each approved transition:
+No CoolerMBP installation is required. Run this before installation or upgrade. Record commands that are unavailable as unavailable; do not treat missing new status fields as either a pass or a failure.
 
 ```bash
+sw_vers
+sysctl -n hw.model
+sysctl -n machdep.cpu.brand_string
+sysctl -n hw.perflevel0.physicalcpu
+sysctl -n hw.perflevel1.physicalcpu
+for path in \
+  /Applications/CoolerMBP.app \
+  /Library/PrivilegedHelperTools/com.superstring.CoolerMBP.daemon \
+  /Library/LaunchDaemons/com.superstring.CoolerMBP.daemon.plist \
+  /usr/local/bin/coolermbpctl \
+  /usr/local/sbin/coolermbpsmc \
+  /usr/local/sbin/coolermbp-recover; do
+  if [[ -e "$path" ]]; then echo "present: $path"; else echo "missing: $path"; fi
+done
 sudo scripts/collect-hardware-diagnostics.sh
 ```
 
-The collector creates a private timestamped directory under `/tmp` by default. To select a destination:
+The collector attempts installed daemon/SMC status and launchd inspection. If CoolerMBP is absent or an older version lacks those commands/fields, its report records the command errors or missing files. Use other already-available read-only evidence where possible. Do not infer fan/Ftst state from an unavailable field.
+
+### Diagnostic bundle handling
+
+The default directory is `/tmp/CoolerMBP-validation-${HOST}-${UTC_TIMESTAMP}`. The collector runs as root and creates the directory with mode `0700` (root-owned, accessible only to root). It writes `report.txt`, command stdout/stderr files, available config/recovery JSON, and a timestamp-preserving copy of `/var/log/CoolerMBP.log`.
+
+Inspect locally:
 
 ```bash
-sudo scripts/collect-hardware-diagnostics.sh /tmp/M2-Pro-before
+sudo less /tmp/CoolerMBP-validation-HOST-TIMESTAMP/report.txt
+sudo ls -laT /tmp/CoolerMBP-validation-HOST-TIMESTAMP
 ```
 
-It captures macOS version/build, model/chip/core counts, daemon and standalone SMC status, launchd state, installed binary hashes and app bundle version, source commit/dirty state when run from the checkout, config/recovery metadata, and the full daemon log plus its last 300 lines in `report.txt`. `requested mode` comes from the daemon; `persisted mode` is the saved daemon config. The installed binary hash identifies the installed files; a source commit does not prove that the installed binary was built from that commit.
+Replace the example directory with the actual path printed by the collector. Do not loosen permissions with `chmod 777`. Before retrieving the bundle as your regular user, copy it into a new private directory and take ownership:
 
-If CoolerMBP is not installed, installed status commands will be recorded as missing/errors; the collector is still useful for model/build capture, but it cannot inspect fan/Ftst state without the installed read-only SMC utility. Do not build/install solely to make collection work without approval for the install's SMC effects.
+```bash
+mkdir -m 700 "$HOME/CoolerMBP-diagnostics"
+sudo cp -R /tmp/CoolerMBP-validation-HOST-TIMESTAMP "$HOME/CoolerMBP-diagnostics/"
+sudo chown -R "$(id -u):$(id -g)" "$HOME/CoolerMBP-diagnostics/CoolerMBP-validation-HOST-TIMESTAMP"
+chmod -R go-rwx "$HOME/CoolerMBP-diagnostics/CoolerMBP-validation-HOST-TIMESTAMP"
+```
 
-## Shared preflight on each machine
+Review and redact before sharing. The bundle may disclose local usernames and paths, process IDs, installed software and binary hashes, hardware details, daemon errors, and config/recovery records describing fan modes, targets, or Ftst ownership. Share only the reviewed/redacted copy through an approved secure channel; preserve the original locally for comparison.
 
-1. Connect AC power; keep the Mac on a hard, unobstructed surface at a recorded ambient temperature. Close other fan-control utilities and do not start a stress workload.
-2. Confirm the machine identity and topology against the target-specific section below. Record the exact `hw.model`, chip, `sw_vers -buildVersion`, and core counts; stop if the machine does not match.
-3. Capture the preflight bundle. Then inspect both live status sources:
+A source commit SHA identifies source-tree history only. It does not establish that installed binaries were built from that checkout: the installed app/daemon/tools may be stale, locally modified, built from another tree, or replaced. The collector records installed hashes and app version separately, but those values do not create build provenance.
 
-   ```bash
-   sudo scripts/collect-hardware-diagnostics.sh
-   sudo coolermbpctl ping
-   sudo coolermbpctl status
-   sudo coolermbpsmc status
-   sudo launchctl print system/com.superstring.CoolerMBP.daemon
-   ```
+## PHASE 1 — Controlled installation or upgrade
 
-4. Do not start a transition unless `recoveryRequired=false`, `hardware verified=true`, all fan modes are readable as `auto` or `system`, the direct SMC and daemon readings agree, fan actual RPMs are plausible, and Ftst is either unavailable or readable as `0`/`inactive`. If Ftst is `1`, ownership is `unknown`, or any state is uncertain, stop and report.
-5. Record all competing software and the current power/thermal conditions. Preserve each collector directory unchanged.
-
-## M2 Pro procedure
-
-Target: Apple M2 Pro, 8 P-cores + 4 E-cores, macOS 27.0.1. Ftst was previously reported unavailable; this validation must verify it on the actual machine rather than assume it.
-
-1. Run shared preflight. Confirm chip/model/core counts and the exact OS build. Record `Ftst=unavailable` only if the collector reports it as unavailable; report other results literally.
-2. If preflight passes, request approval for the Cool Surface write. After approval, run:
-
-   ```bash
-   sudo coolermbpctl cool
-   ```
-
-   Wait 25 seconds without adding load. Collect status and logs. Expected: `requested mode=coolSurface`, `persisted mode=coolSurface`, `hardware verified=true`, `recoveryRequired=false`, every fan `manual`, target RPMs within reported min/max, actual RPMs responding toward targets, and strategy `direct` unless a documented fallback was actually taken. If Ftst is unavailable, `ftstFallback` is not an acceptable result; stop if direct mode is rejected. Ftst should remain unavailable (not written).
-3. If the Cool Surface state is normal, request separate approval to return to Apple Automatic. After approval, run:
-
-   ```bash
-   sudo coolermbpctl auto
-   ```
-
-   Collect status immediately and again after 25 seconds. Expected: daemon requested/persisted mode `appleAuto`, hardware verified, recovery not required, fan modes all `auto` or `system`, Ftst unavailable (or `0` if the read-only check instead found it available), and no CoolerMBP-owned Ftst state left active.
-4. Follow the shared failure criteria. Do not repeat the manual transition on this machine if any criterion triggers.
-
-## M3 Max procedure
-
-Target: Apple M3 Max, 12 P-cores + 4 E-cores, macOS 26.6. Ftst availability is unknown until read from this machine.
-
-1. Run shared preflight. Verify exact hardware and OS build. Record Ftst availability/value/ownership from the standalone SMC status; do not infer it from the M2 Pro.
-2. If preflight passes, request approval for the Cool Surface write. After approval, run:
-
-   ```bash
-   sudo coolermbpctl cool
-   ```
-
-   Wait 25 seconds without added load, then collect status and logs. Expected: requested/persisted `coolSurface`, hardware verified, no recovery required, every fan `manual`, targets within reported limits, and actual RPMs responding. Strategy should be `direct` unless logs and status show the guarded `ftstFallback` path. If fallback occurs, it is acceptable only if Ftst was confirmed available/inactive beforehand, the CoolerMBP Ftst ownership metadata was written, status says `ownership=owned`, and readback is `Ftst=1`. Stop if an active unknown Ftst value appears or any part of that chain is missing.
-3. If the manual state is normal, request separate approval to return to Apple Automatic. After approval, run:
-
-   ```bash
-   sudo coolermbpctl auto
-   ```
-
-   Capture status immediately and after 25 seconds. Expected: `appleAuto`, verified/no recovery, all fans `auto` or `system`, and Ftst either unchanged at `0` if unused, or verified `0` with ownership cleared if CoolerMBP owned it. If Ftst remains `1`, ownership is unknown, or readback is uncertain, stop; do not invoke unknown-Ftst recovery automatically.
-4. Follow the shared failure criteria. Do not repeat the manual transition on this machine if any criterion triggers.
-
-## Upgrade from an older installed version
-
-This is a controlled, approval-gated upgrade, not part of the read-only preflight.
-
-1. Before changing software, capture the installed version/hash, current status, config, both recovery records, and full log using the collector. Save the bundle outside the checkout.
-2. Require a clean pre-upgrade state: no recovery required, verified status, no unknown/active Ftst, and all fans auto/system. Stop and report otherwise; do not install over unresolved state.
-3. Close the app and stop other fan writers. Review `install.sh`. It builds first, gracefully boots out the existing daemon, runs the new standalone `auto` recovery, installs files, starts the daemon, then requests `auto` and verifies status. This can write fan mode/target and release an owned Ftst value.
-4. Obtain explicit operator approval for the upgrade's SMC effects. Then run from the intended source checkout:
+1. Review Phase 0 evidence, identify any older installation, and use available read-only tools to assess current fan modes, actual/target RPM, Ftst value/ownership if exposed, daemon health, logs, and other fan-control software.
+2. If the old installation cannot expose the new fields (`hardware verified`, `recovery required`, or Ftst ownership), record them as unavailable. Do not interpret that as failure or success. Require an explicit safety assessment from the available hardware evidence. If fan mode/Ftst state cannot be assessed sufficiently, defer installation and testing; do not guess.
+3. Stop if read-only evidence shows unknown/active Ftst ownership, unexplained manual fan mode, SMC communication errors, abnormal fan behavior, or unresolved recovery. Preserve the Phase 0 bundle and review before any state-changing operation.
+4. Review `install.sh` and record its effects: it builds first; may boot out the existing daemon; runs the new standalone `auto`; replaces the helper, tools and app; bootstraps/enables the daemon; then invokes `launchctl kickstart -k`, requests `auto`, and checks status. The `kickstart -k` force-restarts the service. **The current installer must not be run under a constraint that prohibits forced daemon termination.** That limitation must be resolved before this validation can use `./install.sh`; this documentation-only change does not alter the installer.
+5. Once the installer path is compatible with the active safety constraints, obtain explicit operator approval for the specific installation/upgrade. Then run it manually from the reviewed source checkout:
 
    ```bash
    ./install.sh
    ```
 
-5. If it aborts, do not delete or replace recovery files. Capture a new diagnostic bundle and report whether the service is loaded; continue only after the failure state is reviewed.
+   Do not trigger it from a collector, test script, or unattended sequence. If it aborts or partially installs, preserve `/var/log/CoolerMBP.log`, both recovery metadata files under `/Library/Application Support/CoolerMBP`, and the pre/post diagnostic bundles. Do not remove metadata or rerun the installer until the failure is reviewed.
 
-## Returning to Apple Automatic and Ftst verification
+## PHASE 2 — Post-installation baseline verification
 
-The transition command is **SMC WRITE — explicit approval required**:
+After the operator has completed Phase 1, collect a new bundle and inspect both status sources:
+
+```bash
+sudo scripts/collect-hardware-diagnostics.sh
+sudo coolermbpctl ping
+sudo coolermbpctl status
+sudo coolermbpsmc status
+```
+
+Require all of the following before any mode test:
+
+- Requested mode: `appleAuto`.
+- Persisted mode: `appleAuto`.
+- `hardware verified=true` and `recovery required=false`.
+- Every fan mode is `auto` or `system`; daemon and direct SMC readings agree.
+- Ftst is confirmed absent/unavailable or readable as `0`/inactive; no unknown ownership.
+- No unresolved SMC or daemon errors; RPMs and fan behavior are plausible.
+
+If any check is unavailable or fails, stop before Phase 3.
+
+## PHASE 3 — Cool Surface policy verification
+
+Cool Surface is a temperature-dependent policy request, not a command that always enters manual mode. `CoolingPolicy.targetLevel()` returns no manual target below 50°C when fans are not already manual, unless thermal state is serious/critical. The daemon separately overrides to maximum for a 95°C hotspot. At/above 50°C the curve can request manual control. Existing manual control also follows its release hysteresis. The control temperature is the daemon's smoothed representative CPU/GPU temperature, not necessarily an individual sensor peak.
+
+With the operator present and after explicit approval for this potentially SMC-writing request, run:
+
+```bash
+sudo coolermbpctl cool
+sudo coolermbpctl status
+sudo coolermbpsmc status
+```
+
+Record requested/persisted mode, control temperature, thermal state, hotspot, `target cooling`, fan modes/targets/RPMs, Ftst, strategy, and errors. Capture immediately; if the fans are manual, capture again around 25 seconds to observe response.
+
+- Require requested and persisted mode `coolSurface`, `hardware verified=true`, and `recovery required=false`.
+- If policy conditions do not require manual operation, fans remaining `auto`/`system` with no target cooling is a valid result, **not a failed transition**. Do not artificially heat the Mac to trigger the curve.
+- If policy does require cooling, verify all fans are manual, targets are within reported min/max, and actual RPMs respond. Record whether strategy was `direct` or `ftstFallback` and the Ftst value/ownership.
+- If preconditions, response, or Ftst ownership become uncertain, stop.
+
+After capturing the result, request separate explicit approval to restore Apple Automatic, even if the policy left fans automatic. Then run `sudo coolermbpctl auto` and verify the criteria in Phase 5. Do not proceed to Phase 4 until that baseline is verified.
+
+## PHASE 4 — Approved maximum-mode/manual-control verification
+
+This is the deterministic manual-control check. Preconditions: the Phase 2 baseline or latest Phase 5 restoration verified Apple Automatic, with no recovery required, no unknown Ftst state, no competing fan controller, operator present, normal ambient conditions, and no stress workload. Do not run CatBoost or CPU/GPU stress tools.
+
+After separate explicit approval for maximum fan control, run:
+
+```bash
+sudo coolermbpctl max
+sudo coolermbpctl status
+sudo coolermbpsmc status
+```
+
+Capture status immediately, then observe without adding load for approximately 25 seconds and collect status again. Require requested/persisted mode `maximum`, `hardware verified=true`, `recovery required=false`, all fans `manual`, targets at reported maximum and within limits, and actual RPM response. Record `strategy` and Ftst availability/value/ownership. On M2 Pro, do not expect or permit Ftst fallback if Ftst is unavailable; if direct mode fails, stop. On M3 Max, accept fallback only when observed and owned by CoolerMBP with verified Ftst readback; never override unknown ownership.
+
+If any criterion is abnormal, stop and report. If the state is normal, obtain a **separate explicit approval** for restoration, then use Phase 5. Never automate this write-and-restore sequence.
+
+## PHASE 5 — Verified Apple Automatic restoration
+
+Restoration is a separate **SMC WRITE — explicit operator approval required** after each Phase 3 or Phase 4 request:
 
 ```bash
 sudo coolermbpctl auto
@@ -130,14 +160,15 @@ sudo coolermbpctl status
 sudo coolermbpsmc status
 ```
 
-Success requires verified status, no recovery required, all fan modes `auto` or `system`, and Ftst absent or read back as `0`. When CoolerMBP used Ftst fallback, ownership must no longer be `owned`, and logs should include verified release. Do not treat a success message alone as sufficient; compare both status commands and retain the output.
+Capture immediately and again after approximately 25 seconds. Require requested/persisted `appleAuto`, `hardware verified=true`, `recovery required=false`, every fan `auto` or `system`, and direct/daemon state agreement. Ftst must be confirmed absent or read back as `0`; if CoolerMBP owned Ftst, ownership must be cleared. Review logs for verified restoration and no unresolved errors. A success message alone is insufficient.
 
-## Graceful daemon restart
+If restoration fails or Ftst remains active/unknown, stop. Do not automatically run unknown-ownership recovery. Preserve diagnostics and request human review.
 
-Restart only after a normal verified Apple Automatic state and explicit approval for a shutdown path that may write SMC state. Do not use `kill -9`, SIGKILL, or `launchctl kickstart -k`.
+## PHASE 6 — Graceful daemon restart
+
+Only restart from a Phase 5 verified Apple Automatic state. Obtain explicit approval for daemon shutdown/restart because shutdown may restore SMC state. Do not use `kill -9`, `SIGKILL`, or `launchctl kickstart -k`.
 
 ```bash
-sudo coolermbpctl auto
 sudo coolermbpctl status
 sudo launchctl bootout system/com.superstring.CoolerMBP.daemon
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.superstring.CoolerMBP.daemon.plist
@@ -146,74 +177,72 @@ sudo coolermbpctl status
 sudo coolermbpsmc status
 ```
 
-`bootout` delivers a normal service stop; the daemon's shutdown handler attempts to restore Apple Automatic. If `bootout` or `bootstrap` fails, do not force-kill it; capture status/logs and stop.
+After restart, repeat the Phase 2 baseline criteria. If bootout/bootstrap or verification fails, collect diagnostics and stop; do not force-kill or auto-recover.
 
-## Failure criteria
+## Target-specific notes
 
-Stop the transition sequence and report immediately if any of these occur:
+Apply Phases 0–6 identically to each target; do not transfer one Mac's Ftst result to the other.
 
-- `recoveryRequired=true`, `hardware verified=false`, or status is stale/unavailable.
-- Any fan mode is unknown, cannot be read, does not match the requested mode, or direct and daemon status disagree.
-- An RPM is implausible, does not respond after 25 seconds, leaves reported limits, or fan noise/behavior is abnormal.
-- Ftst is active unexpectedly, ownership is unknown, its format/read fails, or it remains active after a verified Auto request.
-- Any AppleSMC communication/read/write error, transition timeout, or daemon error indicating failed verification/recovery.
-- A fan-control app/process is discovered that was not stopped before testing.
+- **M2 Pro:** expected inventory is 8 P-cores + 4 E-cores and macOS 27.0.1. Ftst was previously reported unavailable, but verify and record actual availability/value. If unavailable, manual-control testing must succeed through direct mode; otherwise stop.
+- **M3 Max:** expected inventory is 12 P-cores + 4 E-cores and macOS 26.6. Ftst availability is unknown until read from this machine. Record observed Ftst state and only accept the guarded fallback if ownership/readback evidence is complete.
 
-On stop: do not issue another mode command, restart, install, or recovery command automatically. Capture a read-only bundle, preserve timestamps/logs, note current mode/RPM/Ftst fields, and report. A recovery action requires separate human review and explicit approval.
+Record exact `hw.model`, macOS build, and CPU topology even when they differ from the expected target description. Stop if the physical machine is not the intended target.
 
-## Emergency recovery
+## Stop criteria and emergency recovery
 
-First collect the current state if communication still works. The standard recovery helper can modify SMC state and is **not** a read-only diagnostic; run only after explicit operator approval and after other fan-control tools are stopped:
+Stop the sequence if recovery is required, hardware verification is false/unavailable, any fan mode cannot be verified, daemon/direct readings disagree, RPM response is abnormal, Ftst is unexpectedly active/unknown/unreadable, SMC communication fails, a transition times out, or an unexplained daemon error occurs. Preserve current state and logs; do not continue to the next phase.
+
+Emergency recovery is not a diagnostic. The standard helper can write SMC state and requires separate explicit operator approval after competing fan tools are stopped:
 
 ```bash
 sudo /usr/local/sbin/coolermbp-recover
 ```
 
-It tries daemon-supervised Apple Automatic first, then a lock-checked standalone restore. It does not authorize unknown fan or unknown Ftst ownership. If it fails, leaves the service disabled, or reports unknown ownership, stop and preserve metadata/logs. Do not run `recover-unknown-ftst` automatically. An unknown-Ftst override is a separate, potentially destructive decision and must not be folded into this procedure.
+It tries daemon-supervised Automatic, then a lock-checked standalone restore. It does not authorize unknown fan/Ftst ownership. If it fails, preserve state and metadata. Never append `recover-unknown-ftst` automatically; any unknown-ownership override requires a distinct human decision and approval.
 
 ## Report template
 
-Complete one copy per machine and per transition. Attach the immutable collector directories and include local wall-clock timezone plus UTC.
+Complete one report per Mac and per phase/transition. Attach the original diagnostic bundle path and retain timestamps.
 
 ```text
 Machine: [M2 Pro / M3 Max]
-Date/time (local + timezone):
-Date/time (UTC):
+Date/time local + timezone:
+Date/time UTC:
 Operator / approval reference:
 Ambient temperature / power source / surface:
-Other fan-control tools stopped (names):
+Other fan-control tools stopped:
 
-macOS version and build:
-Hardware model / chip:
-P-core / E-core counts:
+macOS version/build:
+Hardware model / chip / P-core / E-core counts:
 CoolerMBP app version/build:
-Installed daemon/CLI/SMC tool SHA-256:
+Installed daemon/CLI/SMC SHA-256:
 Source checkout commit / dirty state:
 Collector directory:
+Unavailable commands/fields:
 
-Transition: [preflight / Apple Automatic -> Cool Surface / Cool Surface -> Apple Automatic / restart / recovery]
+Phase/transition:
 Command and approval time:
-Requested mode:
-Persisted mode:
-Hardware verified:
-Recovery required:
-Fan rows (index, mode/key, actual RPM, target RPM, min/max RPM):
-Ftst availability:
-Ftst actual value:
-Ftst ownership:
-SMC transition strategy:
-Relevant daemon errors/log events:
-Fan response/noise observations:
-Stop criterion triggered? Which one?
+Requested mode / persisted mode:
+Control temperature / thermal state / hotspot:
+Hardware verified / recovery required:
+Fans (index, mode/key, actual RPM, target RPM, min/max RPM):
+Ftst availability / value / ownership:
+SMC strategy:
+Relevant errors/log events:
+Observed fan response/noise:
+Stop criterion triggered:
 Outcome / next action:
 ```
 
-## Expected transition summary
+## Expected results
 
-| State | Daemon/persisted mode | Fan modes | Ftst | Verification |
-|---|---|---|---|---|
-| Preflight / Apple Automatic | `appleAuto` | `auto` or `system` | unavailable or `0`/inactive; no unknown active ownership | Verified; no recovery required |
-| Cool Surface | `coolSurface` | all `manual` | Normally unchanged; if `ftstFallback` is actually used, `1` and owned until restore | Verified; targets in limits and RPM response observed |
-| Return to Apple Automatic | `appleAuto` | `auto` or `system` | unavailable or verified `0`; CoolerMBP ownership cleared | Verified; no recovery required |
+| Phase/state | Expected mode and hardware state |
+|---|---|
+| Phase 2 baseline | requested/persisted `appleAuto`; verified; no recovery; fans `auto`/`system`; Ftst absent or inactive |
+| Phase 3 Cool Surface below policy trigger | requested/persisted `coolSurface`; verified; fans may correctly remain `auto`/`system`; no artificial heating |
+| Phase 3 when policy requests cooling | requested/persisted `coolSurface`; verified; all fans manual with in-range targets and responding RPM; record direct/Ftst path |
+| Phase 4 maximum | requested/persisted `maximum`; verified; all fans manual at max target with response; record Ftst path |
+| Phase 5 restoration | requested/persisted `appleAuto`; verified; no recovery; fans `auto`/`system`; Ftst absent or `0`, owned state cleared |
+| Phase 6 restart | same verified Apple Automatic baseline after daemon returns |
 
-These are expected observations, not hardware claims. Report only what the target machine returned. A successful command run on one model does not validate the other.
+These are expected observations, not hardware claims. Report only results captured on the target Mac.

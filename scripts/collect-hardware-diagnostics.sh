@@ -65,7 +65,7 @@ capture standalone_smc_status "$SMC" status
 capture launchd_service launchctl print "system/$LABEL"
 
 echo "===== installed_identity ====="
-for path in "$APP/Contents/Info.plist" "$HELPER" "$CLI" "$SMC"; do
+for path in "$APP/Contents/Info.plist" "$HELPER" "/Library/LaunchDaemons/$LABEL.plist" "$CLI" "$SMC"; do
   if [[ -e "$path" ]]; then
     ls -lT "$path"
     shasum -a 256 "$path" 2>&1
