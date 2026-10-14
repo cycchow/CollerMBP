@@ -46,6 +46,8 @@ cd CoolerMBP
 
 The installer builds locally, asks an existing daemon to restore Apple Automatic and stops it before replacing files, installs the root daemon and recovery CLI, then opens the app. An upgrade aborts if the running version cannot confirm Automatic mode.
 
+For approval-gated, read-only-first validation on the M2 Pro and M3 Max, see [the hardware validation runbook](docs/HARDWARE_VALIDATION.md). The diagnostic collector is `scripts/collect-hardware-diagnostics.sh`.
+
 ## Modes
 
 - **Apple Automatic** — no manual override; macOS controls the fans.
