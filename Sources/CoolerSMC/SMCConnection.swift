@@ -4,13 +4,48 @@ import IOKit
 protocol SMCTransport: AnyObject {
     func readKey(_ key: String) -> (success: Bool, bytes: [UInt8], size: UInt32, type: String)
     func writeKey(_ key: String, bytes: [UInt8]) -> SMCWriteResult
-    func getKeyInfo(_ key: String) -> (size: UInt32, type: String)?
+    func getKeyInfo(_ key: String) -> SMCKeyInfoResult
+}
+
+public enum SMCKeyInfoResult: Equatable, Sendable {
+    case available(size: UInt32, type: String)
+    case absent
+    case failure(SMCKeyInfoFailure)
+}
+
+public struct SMCKeyInfoFailure: Equatable, Sendable, CustomStringConvertible {
+    public let kernelReturn: Int32?
+    public let firmwareResult: UInt8?
+
+    public init(kernelReturn: Int32?, firmwareResult: UInt8?) {
+        self.kernelReturn = kernelReturn
+        self.firmwareResult = firmwareResult
+    }
+
+    public var description: String {
+        "kernel=\(String(describing: kernelReturn)), firmware=\(String(describing: firmwareResult))"
+    }
 }
 
 struct SMCWriteResult {
     let success: Bool
     let kernelReturn: Int32?
     let firmwareResult: UInt8?
+}
+
+enum SMCKeyInfoResponse {
+    static let notFound: UInt8 = 0x84
+
+    static func classify(kernelReturn: Int32, firmwareResult: UInt8, size: UInt32, type: String) -> SMCKeyInfoResult {
+        guard kernelReturn == 0 else {
+            return .failure(SMCKeyInfoFailure(kernelReturn: kernelReturn, firmwareResult: nil))
+        }
+        if firmwareResult == notFound { return .absent }
+        guard firmwareResult == 0 else {
+            return .failure(SMCKeyInfoFailure(kernelReturn: nil, firmwareResult: firmwareResult))
+        }
+        return .available(size: size, type: type)
+    }
 }
 
 // AppleSMC userspace structure/command interface.
@@ -153,13 +188,18 @@ public final class SMCConnection {
         return SMCWriteResult(success: output.result == 0, kernelReturn: nil, firmwareResult: output.result)
     }
 
-    public func getKeyInfo(_ key: String) -> (size: UInt32, type: String)? {
+    public func getKeyInfo(_ key: String) -> SMCKeyInfoResult {
         var input = SMCParamStruct()
         var output = SMCParamStruct()
         input.key = fourCharCode(key)
         input.data8 = SMCCommand.readKeyInfo.rawValue
-        guard callSMC(&input, &output) == kIOReturnSuccess else { return nil }
-        return (output.keyInfo.dataSize, fourCharString(output.keyInfo.dataType))
+        let kernelReturn = Int32(callSMC(&input, &output))
+        return SMCKeyInfoResponse.classify(
+            kernelReturn: kernelReturn,
+            firmwareResult: output.result,
+            size: output.keyInfo.dataSize,
+            type: fourCharString(output.keyInfo.dataType)
+        )
     }
 
     private func callSMC(_ input: inout SMCParamStruct, _ output: inout SMCParamStruct) -> kern_return_t {

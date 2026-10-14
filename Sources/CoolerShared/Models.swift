@@ -37,6 +37,8 @@ public struct FanReading: Codable, Hashable, Sendable {
 public struct DaemonStatus: Codable, Sendable {
     public let timestamp: Date
     public let mode: CoolingMode
+    public let persistedMode: CoolingMode?
+    public let hardwareVerified: Bool?
     public let controlTemperature: Double?
     public let cpuPeakTemperature: Double?
     public let gpuPeakTemperature: Double?
@@ -52,6 +54,8 @@ public struct DaemonStatus: Codable, Sendable {
     public init(
         timestamp: Date,
         mode: CoolingMode,
+        persistedMode: CoolingMode? = nil,
+        hardwareVerified: Bool? = nil,
         controlTemperature: Double?,
         cpuPeakTemperature: Double?,
         gpuPeakTemperature: Double?,
@@ -66,6 +70,8 @@ public struct DaemonStatus: Codable, Sendable {
     ) {
         self.timestamp = timestamp
         self.mode = mode
+        self.persistedMode = persistedMode
+        self.hardwareVerified = hardwareVerified
         self.controlTemperature = controlTemperature
         self.cpuPeakTemperature = cpuPeakTemperature
         self.gpuPeakTemperature = gpuPeakTemperature

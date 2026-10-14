@@ -19,9 +19,13 @@ let package = Package(
             dependencies: ["CoolerShared"],
             linkerSettings: [.linkedFramework("IOKit")]
         ),
+        .target(
+            name: "CoolerDaemonCore",
+            dependencies: ["CoolerShared", "CoolerSMC"]
+        ),
         .executableTarget(
             name: "CoolerDaemon",
-            dependencies: ["CoolerShared", "CoolerSMC"],
+            dependencies: ["CoolerShared", "CoolerSMC", "CoolerDaemonCore"],
             linkerSettings: [
                 .linkedFramework("Security"),
                 .linkedFramework("SystemConfiguration")
@@ -50,6 +54,10 @@ let package = Package(
         .testTarget(
             name: "CoolerSMCTests",
             dependencies: ["CoolerSMC"]
+        ),
+        .testTarget(
+            name: "CoolerDaemonTests",
+            dependencies: ["CoolerDaemonCore", "CoolerSMC", "CoolerShared"]
         )
     ]
 )

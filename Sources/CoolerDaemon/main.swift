@@ -1,5 +1,6 @@
 import Foundation
 import CoolerShared
+import CoolerDaemonCore
 
 final class DaemonService: NSObject, CoolerDaemonXPCProtocol {
     let runtime: ControllerRuntime

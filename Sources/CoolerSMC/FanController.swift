@@ -32,6 +32,11 @@ public enum FanControllerError: Error, CustomStringConvertible {
 public struct RawThermalStatus {
     public let fans: [FanReading]
     public let temperatures: [String: Double]
+
+    public init(fans: [FanReading], temperatures: [String: Double]) {
+        self.fans = fans
+        self.temperatures = temperatures
+    }
 }
 
 public final class FanController {
@@ -80,25 +85,53 @@ public final class FanController {
     }
 
     public var hardwareInfo: String {
-        let ftst = smc.readKey(Self.forceTestKey)
-        let value = ftst.success && ftst.bytes.count == 1 ? String(ftst.bytes[0]) : "unreadable"
+        let capability = discoverFtst()
+        let value: String
+        if case .available = capability {
+            let ftst = smc.readKey(Self.forceTestKey)
+            value = ftst.success && ftst.size == 1 && ftst.type == "ui8 " && ftst.bytes.count == 1
+                ? String(ftst.bytes[0]) : "read-error"
+        } else {
+            value = capability.diagnostic
+        }
         let transition = lastTransitionDate.map { ISO8601DateFormatter().string(from: $0) } ?? "none"
-        let ownership = ftstOwnership
-        let recoveryRequired = ownership == "unknown" || ownership == "unreadable" || ftstAvailability == "unsupported-format"
-        return "Ftst=\(ftstAvailability):\(value), ownership=\(ownership), strategy=\(manualStrategy), lastTransition=\(transition), recoveryRequired=\(recoveryRequired)"
+        let ownership = ftstOwnership(for: capability)
+        let recoveryRequired = ownership == "unknown" || ownership.hasPrefix("read-error") || ownership == "unsupported-format"
+        return "Ftst=\(capability.diagnostic):\(value), ownership=\(ownership), strategy=\(manualStrategy), lastTransition=\(transition), recoveryRequired=\(recoveryRequired)"
     }
 
     public var ftstAvailability: String {
-        guard let info = smc.getKeyInfo(Self.forceTestKey) else { return "unavailable" }
-        return info.size == 1 && info.type == "ui8 " ? "available" : "unsupported-format"
+        discoverFtst().diagnostic
     }
 
     public var ftstOwnership: String {
-        guard ftstAvailability == "available" else { return "unavailable" }
+        ftstOwnership(for: discoverFtst())
+    }
+
+    private func ftstOwnership(for capability: FtstCapability) -> String {
+        switch capability {
+        case .absent: return "unavailable"
+        case .unsupportedFormat: return "unsupported-format"
+        case .readError(let failure): return "read-error(\(failure))"
+        case .available: break
+        }
         let result = smc.readKey(Self.forceTestKey)
-        guard result.success, result.size == 1, result.type == "ui8 ", result.bytes.count == 1 else { return "unreadable" }
+        guard result.success, result.size == 1, result.type == "ui8 ", result.bytes.count == 1 else { return "read-error(value)" }
         if result.bytes[0] == 0 { return "inactive" }
+        if result.bytes[0] != 1 { return "unsupported-value(\(result.bytes[0]))" }
         return ownsFtst ? "owned" : "unknown"
+    }
+
+    private func discoverFtst() -> FtstCapability {
+        switch smc.getKeyInfo(Self.forceTestKey) {
+        case .absent:
+            return .absent
+        case .failure(let error):
+            return .readError(error)
+        case .available(let size, let type):
+            guard size == 1, type == "ui8 " else { return .unsupportedFormat(size: size, type: type) }
+            return .available
+        }
     }
 
     public func status() throws -> RawThermalStatus {
@@ -128,8 +161,17 @@ public final class FanController {
 
     public func setCoolingLevel(_ level: Double) throws {
         guard writeEnabled else { throw FanControllerError.writeFailed("SMC writer lock unavailable; controller is read-only") }
-        if ftstOwnership == "unknown" || ftstOwnership == "unreadable" {
-            throw FanControllerError.unlockFailed("Ftst is active with unknown ownership or unreadable state")
+        let ftst = discoverFtst()
+        switch ftst {
+        case .absent:
+            guard !ownsFtst else { throw FanControllerError.unlockFailed("Ftst was previously owned but is now absent") }
+        case .available:
+            let ownership = ftstOwnership(for: ftst)
+            guard ownership == "inactive" || ownership == "owned" else {
+                throw FanControllerError.unlockFailed("Ftst state is not safe for manual control: \(ownership)")
+            }
+        case .unsupportedFormat, .readError:
+            throw FanControllerError.unlockFailed("Ftst discovery is uncertain: \(ftst.diagnostic)")
         }
         let clamped = min(max(level, 0), 1)
         let count = try fanCount()
@@ -208,7 +250,12 @@ public final class FanController {
             throw FanControllerError.recoveryFailed(["fan \(fan.index) has unsupported mode \(fan.mode)"])
         }
         var ftstValue: UInt8?
-        if ftstAvailability == "available" {
+        switch discoverFtst() {
+        case .absent:
+            guard !ownsFtst else {
+                throw FanControllerError.recoveryFailed(["Ftst was previously owned but is now confirmed absent"])
+            }
+        case .available:
             let ftst = smc.readKey(Self.forceTestKey)
             guard ftst.success, ftst.size == 1, ftst.type == "ui8 ", ftst.bytes.count == 1 else {
                 throw FanControllerError.recoveryFailed(["Ftst ownership cannot be verified"])
@@ -220,8 +267,10 @@ public final class FanController {
             if ftst.bytes[0] == 1 && !ownsFtst && !allowUnknownFtstRelease {
                 throw FanControllerError.recoveryFailed(["Ftst is active with unknown ownership"])
             }
-        } else if ownsFtst {
-            throw FanControllerError.recoveryFailed(["Ftst was previously owned but is now unavailable"])
+        case .unsupportedFormat(let size, let type):
+            throw FanControllerError.recoveryFailed(["Ftst has unsupported format size=\(size) type=\(type)"])
+        case .readError(let failure):
+            throw FanControllerError.recoveryFailed(["Ftst discovery failed: \(failure)"])
         }
 
         var failures: [String] = []
@@ -385,7 +434,9 @@ public final class FanController {
     }
 
     private func enableOwnedFtst() throws {
-        guard ftstAvailability == "available" else { throw FanControllerError.unlockFailed("Ftst unavailable") }
+        guard case .available = discoverFtst() else {
+            throw FanControllerError.unlockFailed("Ftst unavailable or uncertain: \(ftstAvailability)")
+        }
         let state = smc.readKey(Self.forceTestKey)
         guard state.success, state.size == 1, state.type == "ui8 ", state.bytes.count == 1 else {
             throw FanControllerError.unlockFailed("Ftst state unreadable or has unsupported type")
@@ -410,12 +461,20 @@ public final class FanController {
     }
 
     private func modeKey(for index: Int) throws -> String {
+        var failures: [String] = []
         for template in [Self.modeUpperTemplate, Self.modeLowerTemplate] {
             let key = Self.key(template, fan: index)
-            guard let info = smc.getKeyInfo(key), info.size == 1, info.type == "ui8 " else { continue }
-            return key
+            switch smc.getKeyInfo(key) {
+            case .available(let size, let type):
+                if size == 1 && type == "ui8 " { return key }
+                failures.append("\(key) unsupported format size=\(size) type=\(type)")
+            case .absent:
+                continue
+            case .failure(let failure):
+                failures.append("\(key) discovery failed: \(failure)")
+            }
         }
-        throw FanControllerError.readFailed("F\(index)Md/F\(index)md (unsupported or unavailable)")
+        throw FanControllerError.readFailed("F\(index)Md/F\(index)md (\(failures.joined(separator: "; ")))")
     }
 
     private func persistOwnership(_ owned: Bool) throws {
@@ -473,4 +532,20 @@ public final class FanController {
 
 private struct RecoveryMetadata: Codable {
     let ownsFtst: Bool
+}
+
+private enum FtstCapability {
+    case available
+    case absent
+    case unsupportedFormat(size: UInt32, type: String)
+    case readError(SMCKeyInfoFailure)
+
+    var diagnostic: String {
+        switch self {
+        case .available: return "available"
+        case .absent: return "unavailable"
+        case .unsupportedFormat(let size, let type): return "unsupported-format(size=\(size),type=\(type))"
+        case .readError(let failure): return "read-error(\(failure))"
+        }
+    }
 }

@@ -3,6 +3,24 @@ import CoolerShared
 @testable import CoolerSMC
 
 final class FanSafetyTests: XCTestCase {
+    func testKeyInfoResponseClassifiesConfirmedAbsence() {
+        XCTAssertEqual(
+            SMCKeyInfoResponse.classify(kernelReturn: 0, firmwareResult: 0x84, size: 0, type: "????"),
+            .absent
+        )
+    }
+
+    func testKeyInfoResponsePreservesKernelAndFirmwareFailures() {
+        XCTAssertEqual(
+            SMCKeyInfoResponse.classify(kernelReturn: -1, firmwareResult: 0, size: 0, type: "????"),
+            .failure(SMCKeyInfoFailure(kernelReturn: -1, firmwareResult: nil))
+        )
+        XCTAssertEqual(
+            SMCKeyInfoResponse.classify(kernelReturn: 0, firmwareResult: 0x82, size: 0, type: "????"),
+            .failure(SMCKeyInfoFailure(kernelReturn: nil, firmwareResult: 0x82))
+        )
+    }
+
     func testHealthyFanResponsePasses() throws {
         let fan = FanReading(index: 0, actualRPM: 3500, targetRPM: 3700, minRPM: 1200, maxRPM: 6000, mode: "manual")
         XCTAssertNoThrow(try FanController.verifyFanResponse([fan]))
@@ -59,6 +77,35 @@ final class FanSafetyTests: XCTestCase {
         let controller = FanController(smc: smc)
         XCTAssertNoThrow(try controller.setCoolingLevel(0.5))
         XCTAssertEqual(smc.writeCounts["Ftst"], nil)
+    }
+
+    func testConfirmedFtstAbsencePreservesDirectManualControl() {
+        let smc = MockSMC(fanCount: 1)
+        XCTAssertNoThrow(try FanController(smc: smc).setCoolingLevel(0.5))
+        XCTAssertEqual(smc.values["F0md"], [1])
+        XCTAssertNil(smc.writeCounts["Ftst"])
+    }
+
+    func testFtstFirmwareDiscoveryFailureBlocksRecoveryBeforeWrites() {
+        let smc = MockSMC(fanCount: 1)
+        smc.values["F0md"] = [1]
+        smc.keyInfoResults["Ftst"] = .failure(SMCKeyInfoFailure(kernelReturn: nil, firmwareResult: 0x82))
+
+        XCTAssertThrowsError(try FanController(smc: smc).resetAppleAutomatic())
+        XCTAssertNil(smc.writeCounts["F0md"])
+        XCTAssertNil(smc.writeCounts["Ftst"])
+        XCTAssertTrue(FanController(smc: smc).hardwareInfo.contains("firmware=Optional(130)"))
+    }
+
+    func testUnsupportedFtstFormatBlocksRecoveryBeforeWrites() {
+        let smc = MockSMC(fanCount: 1, hasFtst: true)
+        smc.values["F0md"] = [1]
+        smc.keyInfoResults["Ftst"] = .available(size: 2, type: "ui8 ")
+
+        XCTAssertThrowsError(try FanController(smc: smc).resetAppleAutomatic())
+        XCTAssertNil(smc.writeCounts["F0md"])
+        XCTAssertNil(smc.writeCounts["Ftst"])
+        XCTAssertTrue(FanController(smc: smc).hardwareInfo.contains("unsupported-format"))
     }
 
     func testFtstUnknownOwnershipIsNotCleared() throws {
@@ -176,6 +223,18 @@ final class FanSafetyTests: XCTestCase {
         XCTAssertEqual(smc.writeCounts["Ftst"], nil)
     }
 
+    func testFtstKeyInfoFailureBlocksRecoveryBeforeWrites() {
+        let smc = MockSMC(fanCount: 1, hasFtst: true)
+        smc.values["F0md"] = [1]
+        smc.keyInfoResults["Ftst"] = .failure(SMCKeyInfoFailure(kernelReturn: -1, firmwareResult: nil))
+
+        XCTAssertThrowsError(try FanController(smc: smc).resetAppleAutomatic())
+        XCTAssertEqual(smc.values["F0md"], [1])
+        XCTAssertNil(smc.writeCounts["F0md"])
+        XCTAssertNil(smc.writeCounts["Ftst"])
+        XCTAssertTrue(FanController(smc: smc).hardwareInfo.contains("Ftst=read-error"))
+    }
+
     func testFtstWriteFailureIsReported() {
         let smc = MockSMC(fanCount: 1, hasFtst: true)
         smc.values["F0md"] = [3]
@@ -235,9 +294,12 @@ final class FanSafetyTests: XCTestCase {
 
     func testSMCWriterLockPreventsSecondWriter() throws {
         let path = "/private/tmp/CoolerMBP-lock-\(UUID().uuidString)"
-        let first = try SMCWriterLock(path: path)
+        var first: SMCWriterLock? = try SMCWriterLock(path: path)
         XCTAssertThrowsError(try SMCWriterLock(path: path))
         withExtendedLifetime(first) {}
+        first = nil
+        let afterRelease = try SMCWriterLock(path: path)
+        withExtendedLifetime(afterRelease) {}
         try? FileManager.default.removeItem(atPath: path)
     }
 
@@ -259,6 +321,7 @@ private final class MockSMC: SMCTransport {
     var unreadableKeys: Set<String> = []
     var ignoredWrites: Set<String> = []
     var invalidKeyTypes: [String: String] = [:]
+    var keyInfoResults: [String: SMCKeyInfoResult] = [:]
     private let hasFtst: Bool
     private var pendingTargets: [String: [UInt8]] = [:]
 
@@ -307,13 +370,14 @@ private final class MockSMC: SMCTransport {
         return SMCWriteResult(success: true, kernelReturn: nil, firmwareResult: 0)
     }
 
-    func getKeyInfo(_ key: String) -> (size: UInt32, type: String)? {
-        if key == "Ftst" { return hasFtst ? (1, "ui8 ") : nil }
-        if key == "FNum" { return (1, "ui8 ") }
-        if key.range(of: #"F[0-9](Ac|Tg|Mn|Mx)"#, options: .regularExpression) != nil { return (4, "flt ") }
+    func getKeyInfo(_ key: String) -> SMCKeyInfoResult {
+        if let result = keyInfoResults[key] { return result }
+        if key == "Ftst" { return hasFtst ? .available(size: 1, type: "ui8 ") : .absent }
+        if key == "FNum" { return .available(size: 1, type: "ui8 ") }
+        if key.range(of: #"F[0-9](Ac|Tg|Mn|Mx)"#, options: .regularExpression) != nil { return .available(size: 4, type: "flt ") }
         if key.range(of: #"F[0-9](md|Md)"#, options: .regularExpression) != nil,
-           values[key] != nil { return (1, invalidKeyTypes[key] ?? "ui8 ") }
-        return nil
+           values[key] != nil { return .available(size: 1, type: invalidKeyTypes[key] ?? "ui8 ") }
+        return .absent
     }
 
     private static func floatBytes(_ value: Float) -> [UInt8] {

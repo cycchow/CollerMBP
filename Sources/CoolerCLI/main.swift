@@ -31,6 +31,8 @@ final class Client {
                 print("hardware: \(self.hardwareModel())")
                 print("macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)")
                 print("requested mode: \(status.mode.rawValue)")
+                print("persisted mode: \(status.persistedMode?.rawValue ?? "unknown")")
+                print("hardware verified: \(status.hardwareVerified == true)")
                 print("hardware recovery required: \(status.recoveryRequired == true)")
                 print("verified fan-control: \(status.fans.map(\.mode).joined(separator: ", "))")
                 print("thermal state: \(status.thermalState)")
