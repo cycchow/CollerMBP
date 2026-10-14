@@ -22,8 +22,8 @@ This runbook prepares controlled validation on the M2 Pro and M3 Max. Hardware v
 | `sudo coolermbpctl cool` | SMC WRITE — explicit operator approval required | Persists Cool Surface. It may enter manual control if policy and thermal conditions require it. |
 | `sudo coolermbpctl max` | SMC WRITE — explicit operator approval required | Requests deterministic maximum fan control and verifies all fans entered manual mode. |
 | `sudo coolermbpctl auto` | SMC WRITE — separate explicit operator approval required | Requests Apple Automatic and verifies hardware readback. |
-| `./install.sh` | INSTALL + SMC WRITE — explicit operator approval required | Builds, stops/replaces/starts services, requests Auto, and may restore fan/Ftst state. See the installer constraint below. |
-| `sudo launchctl bootout ...` | May cause SMC writes | Graceful daemon shutdown calls its restoration handler. Restart only in Phase 6. |
+| `./install.sh` | INSTALL + SMC WRITE — explicit operator approval required | Controlled shutdown, lock check, standalone Auto verification, replacement, enable/bootstrap, and bounded readiness verification. |
+| `sudo launchctl bootout ...` | May cause SMC writes | Requests service shutdown; the daemon handler attempts restoration, but bootout does not guarantee application cleanup. Restart only in Phase 6 and verify hardware afterward. |
 | `sudo /usr/local/sbin/coolermbp-recover` | SMC WRITE — explicit operator approval required | Daemon-first Apple Automatic recovery; never treats unknown Ftst ownership as approved. |
 | `coolermbpsmc recover-unknown-ftst` | Explicit unknown-Ftst SMC WRITE | Not part of the automated or normal validation procedure. Requires separate review and approval. |
 
@@ -82,14 +82,32 @@ A source commit SHA identifies source-tree history only. It does not establish t
 1. Review Phase 0 evidence, identify any older installation, and use available read-only tools to assess current fan modes, actual/target RPM, Ftst value/ownership if exposed, daemon health, logs, and other fan-control software.
 2. If the old installation cannot expose the new fields (`hardware verified`, `recovery required`, or Ftst ownership), record them as unavailable. Do not interpret that as failure or success. Require an explicit safety assessment from the available hardware evidence. If fan mode/Ftst state cannot be assessed sufficiently, defer installation and testing; do not guess.
 3. Stop if read-only evidence shows unknown/active Ftst ownership, unexplained manual fan mode, SMC communication errors, abnormal fan behavior, or unresolved recovery. Preserve the Phase 0 bundle and review before any state-changing operation.
-4. Review `install.sh` and record its effects: it builds first; may boot out the existing daemon; runs the new standalone `auto`; replaces the helper, tools and app; bootstraps/enables the daemon; then invokes `launchctl kickstart -k`, requests `auto`, and checks status. The `kickstart -k` force-restarts the service. **The current installer must not be run under a constraint that prohibits forced daemon termination.** That limitation must be resolved before this validation can use `./install.sh`; this documentation-only change does not alter the installer.
-5. Once the installer path is compatible with the active safety constraints, obtain explicit operator approval for the specific installation/upgrade. Then run it manually from the reviewed source checkout:
+4. Review `install.sh` and its output paths. It builds first, requests `bootout` for an old service, waits for launchd unload and SMC writer-lock release, runs standalone `auto` once and verifies fan/Ftst readback, replaces files, enables the service, and bootstraps it once. It does not use `kickstart -k`: `RunAtLoad=true` starts the enabled service at bootstrap, while `-k` forcibly kills an existing instance.
+5. Obtain explicit operator approval for the specific installation/upgrade. Then run it manually from the reviewed source checkout:
 
    ```bash
    ./install.sh
    ```
 
-   Do not trigger it from a collector, test script, or unattended sequence. If it aborts or partially installs, preserve `/var/log/CoolerMBP.log`, both recovery metadata files under `/Library/Application Support/CoolerMBP`, and the pre/post diagnostic bundles. Do not remove metadata or rerun the installer until the failure is reviewed.
+   Do not trigger it from a collector, test script, or unattended sequence. Installation success requires all four startup checks: service loaded, daemon process running, XPC ping responding, and verified Apple Automatic status (requested/persisted mode, hardwareVerified, recoveryRequired, fan modes and Ftst). A successful `bootstrap` alone is not success.
+
+### Installation failure versus recovery failure
+
+- **Installation failure:** `install.sh` returns nonzero and prints current launchd state, daemon status, direct SMC status, metadata file state, and recent log output. The original recovery metadata is snapshotted under `/var/tmp/CoolerMBP-install-*` before shutdown/recovery. On failure, the directory retains the original metadata, current metadata when present, a failure report, and the daemon log. The service may be unloaded if failure happened before bootstrap, or loaded/running if it happened during readiness checks. Hardware state is whatever the direct status reports; if readback fails, treat it as unknown. Do not rerun installation until this state is reviewed.
+- **Recovery failure:** `coolermbp-recover` returns nonzero and prints whether the service is loaded/running plus daemon/direct hardware status. It preserves a snapshot and failure report under `/var/tmp/CoolerMBP-recovery-*`. If standalone restoration failed verification, current fan/Ftst state may remain manual or unknown. If restoration verified but daemon startup later failed, the direct status captured the verified Automatic state before bootstrap; obtain a fresh read-only direct status before follow-up. The service may remain unloaded but is not disabled. A failed bootstrap/readiness check is never reported as recovery success.
+
+Inspect the newest failure directory without changing it:
+
+```bash
+sudo find /var/tmp -maxdepth 1 -type d \( -name 'CoolerMBP-install-*' -o -name 'CoolerMBP-recovery-*' \) -print
+sudo less /var/tmp/CoolerMBP-install-TIMESTAMP-PID/failure-report.txt
+sudo ls -laT /var/tmp/CoolerMBP-install-TIMESTAMP-PID
+sudo cat /var/tmp/CoolerMBP-install-TIMESTAMP-PID/fan-recovery.json.before
+```
+
+Replace the example with the exact path printed by the script. The recovery JSON may describe fan targets and Ftst ownership; keep these root-owned files private and preserve the original collector bundle/logs.
+
+For safe manual follow-up after either failure, first inspect `sudo launchctl print system/com.superstring.CoolerMBP.daemon`, `sudo /usr/local/bin/coolermbpctl status`, `sudo /usr/local/sbin/coolermbpsmc status`, and the failure report/metadata snapshot. Do not rerun a mode or recovery command just because the daemon is unloaded. Only consider a daemon-only enable/bootstrap after the hardware is freshly verified Apple Automatic and the startup cause is understood; then repeat the complete status checks.
 
 ## PHASE 2 — Post-installation baseline verification
 
@@ -166,7 +184,7 @@ If restoration fails or Ftst remains active/unknown, stop. Do not automatically 
 
 ## PHASE 6 — Graceful daemon restart
 
-Only restart from a Phase 5 verified Apple Automatic state. Obtain explicit approval for daemon shutdown/restart because shutdown may restore SMC state. Do not use `kill -9`, `SIGKILL`, or `launchctl kickstart -k`.
+Only restart from a Phase 5 verified Apple Automatic state. Obtain explicit approval for daemon shutdown/restart because shutdown may restore SMC state. `bootout` asks launchd to unload/stop the service so the daemon can receive its normal shutdown path; it is different from forcibly killing an active process with `kickstart -k`, `kill`, or `SIGKILL`. Bootout itself does not guarantee that application cleanup completed, so hardware state is checked after bootstrap. Do not use forced termination.
 
 ```bash
 sudo coolermbpctl status
@@ -198,7 +216,7 @@ Emergency recovery is not a diagnostic. The standard helper can write SMC state 
 sudo /usr/local/sbin/coolermbp-recover
 ```
 
-It tries daemon-supervised Automatic, then a lock-checked standalone restore. It does not authorize unknown fan/Ftst ownership. If it fails, preserve state and metadata. Never append `recover-unknown-ftst` automatically; any unknown-ownership override requires a distinct human decision and approval.
+It verifies daemon-supervised Automatic first. If that request fails, it requests normal service shutdown, waits for unload and the writer lock, then tries one lock-protected standalone restore. It verifies fan/Ftst readback before enabling/bootstrap once and reports success only after the daemon returns and status verifies Apple Automatic. It does not disable the service permanently or authorize unknown fan/Ftst ownership. If it fails, preserve the printed `/var/tmp/CoolerMBP-recovery-*` snapshot, report, and logs. Never append `recover-unknown-ftst` automatically; any unknown-ownership override requires a distinct human decision and approval.
 
 ## Report template
 

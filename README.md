@@ -44,7 +44,7 @@ cd CoolerMBP
 ./install.sh
 ```
 
-The installer builds locally, asks an existing daemon to restore Apple Automatic and stops it before replacing files, installs the root daemon and recovery CLI, then opens the app. An upgrade aborts if the running version cannot confirm Automatic mode.
+The installer builds locally, requests a controlled shutdown of an existing daemon, waits for it to unload and release the SMC writer lock, and verifies Apple Automatic before replacing installed files. It enables the LaunchDaemon before bootstrapping it once; RunAtLoad starts it. A bounded readiness check verifies service load, process state, XPC ping, requested/persisted Apple Automatic, fan modes, recovery state, and Ftst before reporting success. It does not use `launchctl kickstart -k`. On failure it returns nonzero, reports the current service/hardware state, and retains a metadata snapshot under `/var/tmp/CoolerMBP-install-*`.
 
 For approval-gated, read-only-first validation on the M2 Pro and M3 Max, see [the hardware validation runbook](docs/HARDWARE_VALIDATION.md). The diagnostic collector is `scripts/collect-hardware-diagnostics.sh`.
 
@@ -82,13 +82,15 @@ sudo coolermbpctl auto
 
 ## Emergency recovery
 
-Try the daemon-supervised restore first. If it times out or cannot respond, the recovery helper disables and requests daemon shutdown, waits up to 20 seconds for the service to unload and the writer lock to become available, then runs and verifies the standalone restore:
+Try the daemon-supervised restore first. The helper verifies daemon status and direct SMC state before reporting success. If the daemon request fails, it requests a controlled shutdown, waits up to 20 seconds for the service to unload and the writer lock to become available, then runs and verifies the standalone restore. If the daemon request succeeds but verification fails, it stops with an error rather than issuing another restoration request. The fallback enables and bootstraps the service once, then waits for XPC and verifies the daemon and direct hardware state:
 
 ```bash
 sudo /usr/local/sbin/coolermbp-recover
 ```
 
 The standalone tool is read-only except for explicit recovery commands; use `coolermbpctl max` for maximum cooling while the daemon is available.
+
+On failure, `coolermbp-recover` returns nonzero and reports launchd state, daemon status, direct SMC status, metadata files, and recent logs. It preserves a copy of the original recovery metadata and a failure report under `/var/tmp/CoolerMBP-recovery-*`; inspect these files before follow-up. It does not disable the service permanently and never invokes unknown-ownership recovery automatically. A successful `launchctl bootout` requests service shutdown, but does not prove application-level cleanup; actual fan and Ftst readback is required.
 
 Ordinary `auto` refuses manual fan states without a matching CoolerMBP transition record. If the daemon is running, the CLI and app report the explicit recovery command. After stopping the daemon and competing fan-control tools, confirming the writer lock is released, and deciding to override unknown fan ownership, run:
 
