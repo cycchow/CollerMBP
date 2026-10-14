@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import CoolerShared
 
 public enum FanControllerError: Error, CustomStringConvertible {
@@ -39,14 +40,37 @@ public struct RawThermalStatus {
     }
 }
 
+struct FanControllerTiming {
+    let manualVerificationTimeout: TimeInterval
+    let rollbackTimeout: TimeInterval
+    let automaticStabilityWindow: TimeInterval
+    let pollInterval: TimeInterval
+
+    static let production = FanControllerTiming(
+        manualVerificationTimeout: 2,
+        rollbackTimeout: 5,
+        automaticStabilityWindow: 1,
+        pollInterval: 0.1
+    )
+    static let testing = FanControllerTiming(
+        manualVerificationTimeout: 0.12,
+        rollbackTimeout: 0.4,
+        automaticStabilityWindow: 0.08,
+        pollInterval: 0.005
+    )
+}
+
 public final class FanController {
     private let smc: any SMCTransport
     private let recoveryURL: URL?
     private let writeEnabled: Bool
+    private let modelIdentifier: String?
+    private let timing: FanControllerTiming
     private var ownsFtst: Bool
     private var manualStrategy = "notApplicable"
     private var lastTransitionDate: Date?
     private var modeKeys: [Int: String] = [:]
+    private var attemptedManualModeKeys: [Int: String] = [:]
 
     private static let fanCountKey = "FNum"
     private static let forceTestKey = "Ftst"
@@ -70,18 +94,36 @@ public final class FanController {
 
     private static let ioftTemperatureKeys = ["TG0B", "TG0H", "TG0V"]
 
+    private static func hardwareModelIdentifier() -> String? {
+        var size = 0
+        guard sysctlbyname("hw.model", nil, &size, nil, 0) == 0, size > 0 else { return nil }
+        var value = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("hw.model", &value, &size, nil, 0) == 0 else { return nil }
+        return String(cString: value)
+    }
+
     public init(writeEnabled: Bool = true) throws {
         guard let connection = SMCConnection() else { throw FanControllerError.connectionFailed }
         self.smc = connection
         self.writeEnabled = writeEnabled
+        self.modelIdentifier = Self.hardwareModelIdentifier()
+        self.timing = .production
         self.recoveryURL = URL(fileURLWithPath: "/Library/Application Support/CoolerMBP/recovery.json")
         self.ownsFtst = Self.readOwnership(from: recoveryURL)
     }
 
-    init(smc: any SMCTransport, recoveryURL: URL? = nil, writeEnabled: Bool = true) {
+    init(
+        smc: any SMCTransport,
+        recoveryURL: URL? = nil,
+        writeEnabled: Bool = true,
+        modelIdentifier: String? = "TestModel",
+        timing: FanControllerTiming = .testing
+    ) {
         self.smc = smc
         self.recoveryURL = recoveryURL
         self.writeEnabled = writeEnabled
+        self.modelIdentifier = modelIdentifier
+        self.timing = timing
         self.ownsFtst = Self.readOwnership(from: recoveryURL)
     }
 
@@ -161,6 +203,10 @@ public final class FanController {
     }
 
     public func setCoolingLevel(_ level: Double) throws {
+        try setCoolingLevel(level, onManualModeWriteAttempt: nil)
+    }
+
+    public func setCoolingLevel(_ level: Double, onManualModeWriteAttempt: ((Int, String) throws -> Void)?) throws {
         guard writeEnabled else { throw FanControllerError.writeFailed("SMC writer lock unavailable; controller is read-only") }
         let ftst = discoverFtst()
         switch ftst {
@@ -181,11 +227,15 @@ public final class FanController {
         for fan in infos where fan.maxRPM <= fan.minRPM || fan.minRPM <= 0 {
             throw FanControllerError.invalidFanLimits(fan.index)
         }
+        if let reason = manualTransitionRestriction(for: infos) {
+            logEvent("manual_transition_unsupported", "reason=\(reason)")
+            throw FanControllerError.unlockFailed(reason)
+        }
 
         do {
             if infos.contains(where: { $0.mode != "manual" }) {
                 logEvent("manual_request", "level=\(clamped)")
-                try enterManualMode(infos)
+                try enterManualMode(infos, onManualModeWriteAttempt: onManualModeWriteAttempt)
             }
 
             let targets = infos.map { fan -> (fan: FanReading, key: String, rpm: Int, bytes: [UInt8]) in
@@ -224,9 +274,16 @@ public final class FanController {
             } while Date() < verificationDeadline
 
             if let failed = pending.first {
+                let readback = (try? fanInfo(failed.fan.index)).map { "mode=\($0.mode) targetRPM=\($0.targetRPM)" } ?? "readback=unavailable"
+                logEvent("target_rpm_readback", "fan=\(failed.fan.index) key=\(failed.key) expectedRPM=\(failed.rpm) \(readback)")
                 throw FanControllerError.writeFailed("\(failed.key) verification")
             }
+            for target in targets {
+                let applied = try fanInfo(target.fan.index)
+                logEvent("target_rpm_readback", "fan=\(target.fan.index) key=\(target.key) mode=\(applied.mode) targetRPM=\(applied.targetRPM) expectedRPM=\(target.rpm)")
+            }
         } catch let operationError {
+            logEvent("rollback_initiated", "reason=\(operationError)")
             do { try resetAppleAutomatic() }
             catch let recoveryError {
                 throw FanControllerError.recoveryFailed([
@@ -238,11 +295,24 @@ public final class FanController {
         }
     }
 
+    public func manualTransitionRestriction(for fans: [FanReading]) -> String? {
+        if modelIdentifier == "Mac14,9" {
+            return "manual control is disabled on Mac14,9: mode writes can activate before a nonzero target is established"
+        }
+        if let fan = fans.first(where: { $0.mode != "manual" && $0.targetRPM <= 0 }) {
+            return "fan \(fan.index) modeKey=\(fan.modeKey ?? "unknown") mode=\(fan.mode) targetRPM=\(fan.targetRPM); refusing manual mode because nonzero target-before-mode behavior is unverified"
+        }
+        return nil
+    }
+
     public func setMaximum() throws {
         try setCoolingLevel(1.0)
     }
 
-    public func resetAppleAutomatic(allowUnknownFtstRelease: Bool = false) throws {
+    public func resetAppleAutomatic(
+        allowUnknownFtstRelease: Bool = false,
+        attemptedFanModeKeys: [Int: String] = [:]
+    ) throws {
         guard writeEnabled else { throw FanControllerError.recoveryFailed(["SMC writer lock unavailable; controller is read-only"]) }
         let count = try fanCount()
         // Read and validate the full recovery state before the first write.
@@ -277,37 +347,94 @@ public final class FanController {
         var failures: [String] = []
         var reconciliationNeeded = false
         var changedFanMode = false
+        var restoreModeKeys = self.attemptedManualModeKeys
+        for (index, key) in attemptedFanModeKeys {
+            guard let fan = fans.first(where: { $0.index == index }), fan.modeKey == key else {
+                throw FanControllerError.recoveryFailed(["fan transition record does not match fan \(index) mode key"])
+            }
+            restoreModeKeys[index] = key
+        }
         for fan in fans where fan.mode == "manual" {
-            let modeKey = fan.modeKey!
+            restoreModeKeys[fan.index] = fan.modeKey!
+        }
+        for (index, modeKey) in restoreModeKeys.sorted(by: { $0.key < $1.key }) {
+            guard fans.contains(where: { $0.index == index && $0.modeKey == modeKey }) else {
+                failures.append("fan \(index) mode key does not match rollback state")
+                continue
+            }
             reconciliationNeeded = true
-            logEvent("automatic_restore_requested", "fan=\(fan.index) mode=\(fan.mode)")
+            let observed = fans.first(where: { $0.index == index })!.mode
+            logEvent("rollback_mode_write_attempted", "fan=\(index) modeKey=\(modeKey) mode=\(observed) targetRPM=\(fans.first(where: { $0.index == index })!.targetRPM) requested=auto")
             let result = smc.writeKey(modeKey, bytes: [0])
             if !result.success {
+                logEvent("rollback_mode_write_rejected", "fan=\(index) modeKey=\(modeKey) mode=\(observed) targetRPM=\(fans.first(where: { $0.index == index })!.targetRPM)")
                 failures.append("\(modeKey) write rejected (kernel=\(String(describing: result.kernelReturn)), firmware=\(String(describing: result.firmwareResult)))")
             } else {
                 changedFanMode = true
+                logEvent("rollback_mode_write_accepted", "fan=\(index) modeKey=\(modeKey) mode=\(observed) targetRPM=\(fans.first(where: { $0.index == index })!.targetRPM)")
             }
         }
-        var fansVerified = true
-        for fan in fans {
-            let deadline = Date().addingTimeInterval(2)
-            var restored = false
-            repeat {
-                let mode = try? fanInfo(fan.index).mode
-                if mode == "auto" || mode == "system" { restored = true; break }
-                Thread.sleep(forTimeInterval: 0.1)
-            } while Date() < deadline
-            if !restored { fansVerified = false; failures.append("fan \(fan.index) mode verification") }
+        var fansVerified = false
+        var stableSince: Date?
+        var rollbackRetries: Set<Int> = []
+        var rollbackReadFailures: Set<Int> = []
+        let stabilizationWindow = restoreModeKeys.isEmpty ? 0 : timing.automaticStabilityWindow
+        let rollbackDeadline = Date().addingTimeInterval(timing.rollbackTimeout)
+        repeat {
+            var allAutomatic = true
+            for fan in fans {
+                do {
+                    let mode = try readFanMode(fan.index)
+                    if mode == "auto" || mode == "system" { continue }
+                    allAutomatic = false
+                    if mode == "manual", let key = restoreModeKeys[fan.index], !rollbackRetries.contains(fan.index) {
+                        rollbackRetries.insert(fan.index)
+                        let targetRPM = (try? fanInfo(fan.index).targetRPM).map(String.init) ?? "unavailable"
+                        logEvent("rollback_delayed_manual_detected", "fan=\(fan.index) modeKey=\(key) mode=\(mode) targetRPM=\(targetRPM)")
+                        let result = smc.writeKey(key, bytes: [0])
+                        if !result.success {
+                            failures.append("\(key) delayed rollback write rejected")
+                            logEvent("rollback_mode_write_rejected", "fan=\(fan.index) modeKey=\(key) mode=\(mode) delayed=true")
+                        } else {
+                            logEvent("rollback_mode_write_accepted", "fan=\(fan.index) modeKey=\(key) mode=\(mode) delayed=true")
+                        }
+                    } else if mode != "manual" {
+                        failures.append("fan \(fan.index) has unsupported rollback mode \(mode)")
+                    }
+                } catch {
+                    allAutomatic = false
+                    if rollbackReadFailures.insert(fan.index).inserted {
+                        logEvent("rollback_mode_readback_unavailable", "fan=\(fan.index) modeKey=\(fan.modeKey ?? "unknown") error=\(error)")
+                    }
+                }
+            }
+            if allAutomatic {
+                if stableSince == nil { stableSince = Date() }
+                if let stableSince, Date().timeIntervalSince(stableSince) >= stabilizationWindow {
+                    fansVerified = true
+                    break
+                }
+            } else {
+                stableSince = nil
+            }
+            if !failures.isEmpty { break }
+            Thread.sleep(forTimeInterval: timing.pollInterval)
+        } while Date() < rollbackDeadline
+        if !fansVerified {
+            failures.append("fan mode restoration did not remain verified Apple Automatic for the stabilization window")
+            logEvent("uncertain_hardware_state", "phase=rollback fansVerified=false pendingManualWrites=\(restoreModeKeys.count)")
+        } else {
+            logEvent("rollback_mode_verification", "fans=\(fans.count) state=stable_automatic window=\(stabilizationWindow)")
         }
         if let ftstValue {
             if ftstValue == 1 && !ownsFtst {
                 reconciliationNeeded = true
-                if fansVerified && allowUnknownFtstRelease {
+                if fansVerified && failures.isEmpty && allowUnknownFtstRelease {
                     logEvent("explicit_unknown_ftst_recovery", "admin_requested=true")
                     let result = smc.writeKey(Self.forceTestKey, bytes: [0])
                     if !result.success { failures.append("explicit Ftst release rejected") }
                 }
-            } else if ftstValue == 1 && ownsFtst && fansVerified {
+            } else if ftstValue == 1 && ownsFtst && fansVerified && failures.isEmpty {
                 reconciliationNeeded = true
                 logEvent("automatic_restore_requested", "releasing_owned_ftst=true")
                 let result = smc.writeKey(Self.forceTestKey, bytes: [0])
@@ -331,6 +458,7 @@ public final class FanController {
             }
         }
         if !failures.isEmpty {
+            logEvent("ownership_record_retained", "reason=automatic_restore_unverified")
             logEvent("automatic_restore_failed", failures.joined(separator: ";"))
             throw FanControllerError.recoveryFailed(failures)
         }
@@ -338,6 +466,7 @@ public final class FanController {
             manualStrategy = "notApplicable"
             lastTransitionDate = Date()
         }
+        if fansVerified { attemptedManualModeKeys.removeAll() }
         if reconciliationNeeded { logEvent("automatic_restore_verified", "fans=\(count), ftst=\(ftstOwnership)") }
     }
 
@@ -371,18 +500,7 @@ public final class FanController {
         guard [actual, target, minimum, maximum].allSatisfy(\.isFinite) else {
             throw FanControllerError.readFailed("fan \(index) RPM keys (invalid type, size, or value)")
         }
-        let modeResult = smc.readKey(modeKey)
-        guard modeResult.success, modeResult.size == 1, modeResult.type == "ui8 ", modeResult.bytes.count == 1 else {
-            throw FanControllerError.readFailed(modeKey)
-        }
-        let modeValue = modeResult.bytes[0]
-        let mode: String
-        switch modeValue {
-        case 0: mode = "auto"
-        case 1: mode = "manual"
-        case 3: mode = "system"
-        default: mode = "unknown(\(modeValue))"
-        }
+        let mode = try readFanMode(index)
 
         return FanReading(
             index: index,
@@ -395,20 +513,36 @@ public final class FanController {
         )
     }
 
-    private func enterManualMode(_ fans: [FanReading]) throws {
+    private func readFanMode(_ index: Int) throws -> String {
+        let key = try modeKey(for: index)
+        let result = smc.readKey(key)
+        guard result.success, result.size == 1, result.type == "ui8 ", result.bytes.count == 1 else {
+            throw FanControllerError.readFailed(key)
+        }
+        switch result.bytes[0] {
+        case 0: return "auto"
+        case 1: return "manual"
+        case 3: return "system"
+        default: throw FanControllerError.readFailed("\(key) invalid mode value \(result.bytes[0])")
+        }
+    }
+
+    private func enterManualMode(_ fans: [FanReading], onManualModeWriteAttempt: ((Int, String) throws -> Void)?) throws {
         for fan in fans where fan.mode != "manual" {
             let key = try modeKey(for: fan.index)
+            attemptedManualModeKeys[fan.index] = key
+            try onManualModeWriteAttempt?(fan.index, key)
+            logEvent("manual_mode_write_attempted", "fan=\(fan.index) modeKey=\(key) mode=\(fan.mode) targetRPM=\(fan.targetRPM) value=1 strategy=direct")
             let direct = smc.writeKey(key, bytes: [1])
             if direct.success {
-                guard (try? fanInfo(fan.index).mode) == "manual" else {
-                    throw FanControllerError.unlockFailed("\(key) write accepted but mode readback did not become manual")
-                }
+                logEvent("manual_mode_write_accepted", "fan=\(fan.index) modeKey=\(key) mode=\(fan.mode) targetRPM=\(fan.targetRPM) strategy=direct")
+                try verifyAcceptedManualModeWrite(fan: fan, key: key, strategy: "direct")
                 manualStrategy = "direct"
                 lastTransitionDate = Date()
-                logEvent("direct_mode_verified", "fan=\(fan.index) key=\(key)")
+                logEvent("direct_mode_verified", "fan=\(fan.index) modeKey=\(key) mode=manual targetRPM=\(fan.targetRPM)")
                 continue
             }
-            logEvent("direct_mode_rejected", "fan=\(fan.index) key=\(key) kernel=\(String(describing: direct.kernelReturn)) firmware=\(String(describing: direct.firmwareResult))")
+            logEvent("manual_mode_write_rejected", "fan=\(fan.index) modeKey=\(key) mode=\(fan.mode) targetRPM=\(fan.targetRPM) strategy=direct kernel=\(String(describing: direct.kernelReturn)) firmware=\(String(describing: direct.firmwareResult))")
             // The reverse-engineered Ftst path is only relevant when firmware
             // reports system-managed mode and rejects a direct mode write.
             guard fan.mode == "system", direct.kernelReturn == nil,
@@ -418,20 +552,75 @@ public final class FanController {
             try enableOwnedFtst()
             logEvent("ftst_fallback_attempt", "fan=\(fan.index)")
             manualStrategy = "ftstFallback"
-            let deadline = Date().addingTimeInterval(6)
-            var entered = false
+            let deadline = Date().addingTimeInterval(timing.manualVerificationTimeout)
+            var fallbackWriteAttempted = false
             repeat {
-                let current = try fanInfo(fan.index)
-                if current.mode == "manual" { entered = true; break }
-                if current.mode == "auto" {
-                    let result = smc.writeKey(key, bytes: [1])
-                    if result.success, (try? fanInfo(fan.index).mode) == "manual" { entered = true; break }
+                let mode = try readFanMode(fan.index)
+                if mode == "manual" {
+                    logEvent("manual_mode_delayed_verification", "fan=\(fan.index) modeKey=\(key) mode=manual targetRPM=\(fan.targetRPM) polls=fallback")
+                    fallbackWriteAttempted = true
+                    break
                 }
-                Thread.sleep(forTimeInterval: 0.2)
+                if mode == "auto" && !fallbackWriteAttempted {
+                    attemptedManualModeKeys[fan.index] = key
+                    try onManualModeWriteAttempt?(fan.index, key)
+                    logEvent("manual_mode_write_attempted", "fan=\(fan.index) modeKey=\(key) mode=auto targetRPM=\(fan.targetRPM) value=1 strategy=ftstFallback")
+                    let result = smc.writeKey(key, bytes: [1])
+                    fallbackWriteAttempted = true
+                    guard result.success else {
+                        logEvent("manual_mode_write_rejected", "fan=\(fan.index) modeKey=\(key) mode=auto targetRPM=\(fan.targetRPM) strategy=ftstFallback kernel=\(String(describing: result.kernelReturn)) firmware=\(String(describing: result.firmwareResult))")
+                        throw FanControllerError.unlockFailed("Ftst fallback \(key)=1 was rejected")
+                    }
+                    logEvent("manual_mode_write_accepted", "fan=\(fan.index) modeKey=\(key) mode=auto targetRPM=\(fan.targetRPM) strategy=ftstFallback")
+                    try verifyAcceptedManualModeWrite(fan: fan, key: key, strategy: "ftstFallback")
+                    break
+                }
+                Thread.sleep(forTimeInterval: timing.pollInterval)
             } while Date() < deadline
-            guard entered else { throw FanControllerError.unlockFailed("Ftst fallback did not transition fan \(fan.index) to manual mode") }
+            guard fallbackWriteAttempted else { throw FanControllerError.unlockFailed("Ftst fallback did not reach a safe mode for fan \(fan.index)") }
             lastTransitionDate = Date()
         }
+    }
+
+    private func verifyAcceptedManualModeWrite(fan: FanReading, key: String, strategy: String) throws {
+        let initialMode: String?
+        do {
+            initialMode = try readFanMode(fan.index)
+            logEvent("manual_mode_initial_readback", "fan=\(fan.index) modeKey=\(key) mode=\(initialMode!) targetRPM=\(fan.targetRPM) strategy=\(strategy)")
+        } catch {
+            initialMode = nil
+            logEvent("manual_mode_initial_readback", "fan=\(fan.index) modeKey=\(key) mode=unavailable targetRPM=\(fan.targetRPM) strategy=\(strategy) error=\(error)")
+        }
+        if initialMode == "manual" { return }
+
+        let deadline = Date().addingTimeInterval(timing.manualVerificationTimeout)
+        var polls = 0
+        var validReadback = initialMode != nil
+        var loggedReadFailure = false
+        repeat {
+            Thread.sleep(forTimeInterval: timing.pollInterval)
+            polls += 1
+            do {
+                let mode = try readFanMode(fan.index)
+                validReadback = true
+                if mode == "manual" {
+                    logEvent("manual_mode_delayed_verification", "fan=\(fan.index) modeKey=\(key) mode=manual targetRPM=\(fan.targetRPM) polls=\(polls) strategy=\(strategy)")
+                    return
+                }
+            } catch {
+                if !loggedReadFailure {
+                    logEvent("manual_mode_readback_transient_failure", "fan=\(fan.index) modeKey=\(key) targetRPM=\(fan.targetRPM) firstPoll=\(polls) error=\(error)")
+                    loggedReadFailure = true
+                }
+            }
+        } while Date() < deadline
+
+        if validReadback {
+            logEvent("uncertain_hardware_state", "fan=\(fan.index) modeKey=\(key) mode=\(initialMode ?? "unavailable") targetRPM=\(fan.targetRPM) outcome=verification_timeout")
+            throw FanControllerError.unlockFailed("\(key) write accepted; manual mode verification timed out after \(timing.manualVerificationTimeout)s")
+        }
+        logEvent("uncertain_hardware_state", "fan=\(fan.index) modeKey=\(key) mode=unavailable targetRPM=\(fan.targetRPM) outcome=readback_unavailable")
+        throw FanControllerError.unlockFailed("\(key) write accepted; SMC mode readback remained unavailable or invalid")
     }
 
     private func enableOwnedFtst() throws {

@@ -146,6 +146,8 @@ final class ControllerRuntimeTests: XCTestCase {
 
     func testPartialTransitionRecoveryFailureBlocksTimerUntilExplicitRecovery() throws {
         let configURL = URL(fileURLWithPath: "/private/tmp/CoolerMBP-config-\(UUID().uuidString)/config.json")
+        let recoveryURL = configURL.deletingLastPathComponent().appendingPathComponent("fan-recovery.json")
+        defer { try? FileManager.default.removeItem(at: configURL.deletingLastPathComponent()) }
         let smc = MockSMC(fanCount: 2)
         smc.failingWrites = { key, bytes in
             key == "F1md" && bytes == [1] || key == "F0md" && bytes == [0]
@@ -155,6 +157,7 @@ final class ControllerRuntimeTests: XCTestCase {
         XCTAssertThrowsError(try setMode(.maximum, on: runtime).get())
         XCTAssertEqual(status(of: runtime).recoveryRequired, true)
         XCTAssertEqual(status(of: runtime).hardwareVerified, false)
+        if case .record = FanTransitionRecordFile.read(from: recoveryURL) {} else { XCTFail("uncertain rollback cleared ownership record") }
         let writesAfterFailure = smc.totalWrites
         XCTAssertThrowsError(try runtime.pollForTesting().get())
         XCTAssertEqual(smc.totalWrites, writesAfterFailure)
@@ -162,6 +165,7 @@ final class ControllerRuntimeTests: XCTestCase {
         smc.failingWrites = { _, _ in false }
         XCTAssertNoThrow(try setMode(.appleAuto, on: runtime).get())
         XCTAssertEqual(status(of: runtime).recoveryRequired, false)
+        XCTAssertEqual(FanTransitionRecordFile.read(from: recoveryURL).isMissing, true)
         XCTAssertTrue(status(of: runtime).fans.allSatisfy { $0.mode == "auto" || $0.mode == "system" })
     }
 

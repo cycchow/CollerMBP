@@ -86,6 +86,155 @@ final class FanSafetyTests: XCTestCase {
         XCTAssertNil(smc.writeCounts["Ftst"])
     }
 
+    func testMac149ManualControlIsDisabledWithoutHardwareSequenceEvidence() {
+        let smc = MockSMC(fanCount: 1)
+        let controller = FanController(smc: smc, modelIdentifier: "Mac14,9")
+
+        XCTAssertThrowsError(try controller.setMaximum()) { error in
+            XCTAssertTrue(String(describing: error).contains("manual control is disabled on Mac14,9"))
+        }
+        XCTAssertNil(smc.writeCounts["F0md"])
+        XCTAssertNil(smc.writeCounts["F0Tg"])
+        XCTAssertNil(smc.writeCounts["Ftst"])
+    }
+
+    func testZeroPreviousTargetBlocksManualActivation() {
+        let smc = MockSMC(fanCount: 1)
+        smc.values["F0Tg"] = MockSMC.floatBytes(0)
+
+        XCTAssertThrowsError(try FanController(smc: smc).setMaximum()) { error in
+            XCTAssertTrue(String(describing: error).contains("targetRPM=0"))
+        }
+        XCTAssertNil(smc.writeCounts["F0md"])
+        XCTAssertNil(smc.writeCounts["F0Tg"])
+    }
+
+    func testImmediateManualModeReadbackIsVerified() throws {
+        let smc = MockSMC(fanCount: 1)
+
+        try FanController(smc: smc).setMaximum()
+
+        XCTAssertEqual(smc.values["F0md"], [1])
+        XCTAssertGreaterThan(try FanController(smc: smc).status().fans[0].targetRPM, 0)
+        XCTAssertEqual(smc.writeCounts["F0md"], 1)
+    }
+
+    func testDelayedManualModeReadbackIsVerifiedWithoutRepeatingWrite() throws {
+        let smc = MockSMC(fanCount: 1)
+        smc.manualModeReadDelays["F0md"] = 3
+
+        try FanController(smc: smc).setMaximum()
+
+        XCTAssertEqual(smc.values["F0md"], [1])
+        XCTAssertEqual(smc.writeCounts["F0md"], 1)
+    }
+
+    func testTransientModeReadbackFailureCanRecoverWithinBoundedVerification() throws {
+        let smc = MockSMC(fanCount: 1)
+        smc.modeReadFailuresAfterManualWrite["F0md"] = 1
+
+        try FanController(smc: smc).setMaximum()
+
+        XCTAssertEqual(smc.values["F0md"], [1])
+        XCTAssertEqual(smc.writeCounts["F0md"], 1)
+    }
+
+    func testAcceptedButUnverifiedManualWriteIsRolledBackAfterDelayedActivation() {
+        let smc = MockSMC(fanCount: 1)
+        smc.manualModeReadDelays["F0md"] = 30
+
+        XCTAssertThrowsError(try FanController(smc: smc).setMaximum()) { error in
+            XCTAssertTrue(String(describing: error).contains("verification timed out"))
+        }
+
+        XCTAssertEqual(smc.values["F0md"], [0])
+        XCTAssertGreaterThanOrEqual(smc.writeCounts["F0md"] ?? 0, 3, "rollback must re-write Auto after delayed Manual activation")
+    }
+
+    func testFailedTransitionWithVerifiedRollbackReturnsAllFansToAutomatic() {
+        let smc = MockSMC(fanCount: 2)
+        smc.failingWrites.insert("F1Tg")
+
+        XCTAssertThrowsError(try FanController(smc: smc).setCoolingLevel(0.5))
+
+        XCTAssertEqual(smc.values["F0md"], [0])
+        XCTAssertEqual(smc.values["F1md"], [0])
+    }
+
+    func testRollbackUncertaintyIsReportedWhenAutomaticWriteCannotTakeEffect() {
+        let smc = MockSMC(fanCount: 1)
+        smc.ignoredAutoWrites.insert("F0md")
+        smc.failingWrites.insert("F0Tg")
+
+        XCTAssertThrowsError(try FanController(smc: smc).setMaximum()) { error in
+            XCTAssertTrue(String(describing: error).contains("recovery"))
+        }
+        XCTAssertEqual(smc.values["F0md"], [1])
+    }
+
+    func testRecordedPendingTransitionCannotClearRecoveryRecordOnImmediateAutoReadback() throws {
+        let smc = MockSMC(fanCount: 1)
+        smc.pendingManualModes["F0md"] = 8
+        smc.ignoredWrites.insert("F0md")
+        let url = URL(fileURLWithPath: "/private/tmp/CoolerMBP-test-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let entry = FanTransitionEntry(index: 0, modeKey: "F0md", previousMode: "auto", previousTargetRPM: 2000, targetRPM: 6000)
+        try FanTransitionRecordFile.write(FanTransitionRecord(phase: .transitioning, fans: [entry], attemptedFanIndexes: [0]), to: url)
+
+        XCTAssertThrowsError(try FanTransitionRecovery.restoreAppleAutomatic(using: FanController(smc: smc), recordURL: url))
+
+        if case .record = FanTransitionRecordFile.read(from: url) {} else { XCTFail("uncertain rollback cleared transition record") }
+        XCTAssertEqual(smc.values["F0md"], [1])
+    }
+
+    func testRecoveryClearsTransitionRecordOnlyAfterStableAutomaticReadback() throws {
+        let smc = MockSMC(fanCount: 1)
+        smc.pendingManualModes["F0md"] = 5
+        let url = URL(fileURLWithPath: "/private/tmp/CoolerMBP-test-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let entry = FanTransitionEntry(index: 0, modeKey: "F0md", previousMode: "auto", previousTargetRPM: 2000, targetRPM: 6000)
+        try FanTransitionRecordFile.write(FanTransitionRecord(phase: .transitioning, fans: [entry], attemptedFanIndexes: [0]), to: url)
+
+        let restored = try FanTransitionRecovery.restoreAppleAutomatic(using: FanController(smc: smc), recordURL: url)
+
+        XCTAssertEqual(restored.fans.first?.mode, "auto")
+        XCTAssertEqual(FanTransitionRecordFile.read(from: url).isMissing, true)
+        XCTAssertGreaterThanOrEqual(smc.writeCounts["F0md"] ?? 0, 2)
+    }
+
+    func testRecordedPartialTransitionRestoresOnlyAttemptedFanAndPreservesOwnership() throws {
+        let smc = MockSMC(fanCount: 2)
+        smc.values["F0md"] = [1]
+        let url = URL(fileURLWithPath: "/private/tmp/CoolerMBP-test-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let entries = (0..<2).map { index in
+            FanTransitionEntry(index: index, modeKey: "F\(index)md", previousMode: "auto", previousTargetRPM: 2000, targetRPM: 6000)
+        }
+        try FanTransitionRecordFile.write(FanTransitionRecord(phase: .transitioning, fans: entries, attemptedFanIndexes: [0]), to: url)
+
+        let restored = try FanTransitionRecovery.restoreAppleAutomatic(using: FanController(smc: smc), recordURL: url)
+
+        XCTAssertTrue(restored.fans.allSatisfy { $0.mode == "auto" })
+        XCTAssertGreaterThan(smc.writeCounts["F0md"] ?? 0, 0)
+        XCTAssertNil(smc.writeCounts["F1md"])
+        XCTAssertEqual(FanTransitionRecordFile.read(from: url).isMissing, true)
+    }
+
+    func testEmptyTransitionAttemptRecordDoesNotClaimMatchingUnknownManualState() throws {
+        let smc = MockSMC(fanCount: 1)
+        smc.values["F0md"] = [1]
+        let url = URL(fileURLWithPath: "/private/tmp/CoolerMBP-test-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let entry = FanTransitionEntry(index: 0, modeKey: "F0md", previousMode: "auto", previousTargetRPM: 2000, targetRPM: 6000)
+        try FanTransitionRecordFile.write(FanTransitionRecord(phase: .transitioning, fans: [entry], attemptedFanIndexes: []), to: url)
+
+        XCTAssertThrowsError(try FanTransitionRecovery.restoreAppleAutomatic(using: FanController(smc: smc), recordURL: url))
+
+        XCTAssertEqual(smc.values["F0md"], [1])
+        XCTAssertNil(smc.writeCounts["F0md"])
+        if case .record = FanTransitionRecordFile.read(from: url) {} else { XCTFail("unknown manual state destroyed transition record") }
+    }
+
     func testFtstFirmwareDiscoveryFailureBlocksRecoveryBeforeWrites() {
         let smc = MockSMC(fanCount: 1)
         smc.values["F0md"] = [1]
@@ -375,12 +524,17 @@ private final class MockSMC: SMCTransport {
     var rejectedWrites: Set<String> = []
     var writeCounts: [String: Int] = [:]
     var targetReadDelay = 0
+    var manualModeReadDelays: [String: Int] = [:]
+    var modeReadFailuresRemaining: [String: Int] = [:]
+    var modeReadFailuresAfterManualWrite: [String: Int] = [:]
     var unreadableKeys: Set<String> = []
     var ignoredWrites: Set<String> = []
+    var ignoredAutoWrites: Set<String> = []
     var invalidKeyTypes: [String: String] = [:]
     var keyInfoResults: [String: SMCKeyInfoResult] = [:]
     private let hasFtst: Bool
     private var pendingTargets: [String: [UInt8]] = [:]
+    var pendingManualModes: [String: Int] = [:]
 
     init(fanCount: UInt8, hasFtst: Bool = false) {
         self.hasFtst = hasFtst
@@ -397,6 +551,18 @@ private final class MockSMC: SMCTransport {
 
     func readKey(_ key: String) -> (success: Bool, bytes: [UInt8], size: UInt32, type: String) {
         if unreadableKeys.contains(key) { return (false, [], 0, "") }
+        if let remaining = modeReadFailuresRemaining[key], remaining > 0 {
+            modeReadFailuresRemaining[key] = remaining - 1
+            return (false, [], 0, "")
+        }
+        if let remaining = pendingManualModes[key] {
+            if remaining <= 1 {
+                values[key] = [1]
+                pendingManualModes[key] = nil
+            } else {
+                pendingManualModes[key] = remaining - 1
+            }
+        }
         if let pending = pendingTargets[key] {
             if targetReadDelay > 0 {
                 targetReadDelay -= 1
@@ -419,11 +585,21 @@ private final class MockSMC: SMCTransport {
             pendingTargets[key] = bytes
             return SMCWriteResult(success: true, kernelReturn: nil, firmwareResult: 0)
         }
-        if !ignoredWrites.contains(key) { values[key] = bytes }
+        if key.lowercased().contains("md"), bytes == [1] {
+            let delay = manualModeReadDelays[key] ?? 0
+            modeReadFailuresRemaining[key] = modeReadFailuresAfterManualWrite[key]
+            if delay > 0 { pendingManualModes[key] = delay }
+            else if !ignoredWrites.contains(key) { values[key] = [1] }
+        } else if key.lowercased().contains("md"), bytes == [0] {
+            let wasManual = values[key] == [1]
+            if !ignoredWrites.contains(key) && !ignoredAutoWrites.contains(key) { values[key] = [0] }
+            if wasManual { pendingManualModes[key] = nil }
+        } else if !ignoredWrites.contains(key) {
+            values[key] = bytes
+        }
         if key == "Ftst", bytes == [1] {
             for index in 0..<10 where values["F\(index)md"] == [3] { values["F\(index)md"] = [0] }
         }
-        if key.contains("md"), bytes == [1] { values[key] = [1] }
         return SMCWriteResult(success: true, kernelReturn: nil, firmwareResult: 0)
     }
 
@@ -437,8 +613,15 @@ private final class MockSMC: SMCTransport {
         return .absent
     }
 
-    private static func floatBytes(_ value: Float) -> [UInt8] {
+    fileprivate static func floatBytes(_ value: Float) -> [UInt8] {
         var value = value
         return withUnsafeBytes(of: &value) { Array($0) }
+    }
+}
+
+private extension FanTransitionRecordRead {
+    var isMissing: Bool {
+        if case .missing = self { return true }
+        return false
     }
 }

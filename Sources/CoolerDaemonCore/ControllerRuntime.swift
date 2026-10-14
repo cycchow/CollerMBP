@@ -468,6 +468,9 @@ public final class ControllerRuntime {
         let needsRefresh = Date().timeIntervalSince(lastApplyDate) >= 10
         if lastAppliedLevel == nil || abs((lastAppliedLevel ?? 0) - clamped) >= 0.025 || needsRefresh {
             let before = try fanController.status()
+            if let reason = fanController.manualTransitionRestriction(for: before.fans) {
+                throw RuntimeTransitionError.failed(reason)
+            }
             let entries = before.fans.map { fan in
                 let target = Double(fan.minRPM) + clamped * Double(fan.maxRPM - fan.minRPM)
                 return FanTransitionEntry(
@@ -481,11 +484,19 @@ public final class ControllerRuntime {
             guard entries.allSatisfy({ !$0.modeKey.isEmpty }) else {
                 throw RuntimeTransitionError.failed("Fan mode key could not be recorded before control transition")
             }
-            try FanTransitionRecordFile.write(FanTransitionRecord(phase: .transitioning, fans: entries), to: fanRecoveryURL)
-            try fanController.setCoolingLevel(clamped)
+            var transitionRecord = FanTransitionRecord(phase: .transitioning, fans: entries, attemptedFanIndexes: [])
+            try FanTransitionRecordFile.write(transitionRecord, to: fanRecoveryURL)
+            fputs("CoolerMBP: event=ownership_record_retained phase=transitioning fans=\(entries.count)\n", stderr)
+            try fanController.setCoolingLevel(clamped) { index, _ in
+                let attempts = Set(transitionRecord.attemptedFanIndexes ?? []).union([index]).sorted()
+                transitionRecord = FanTransitionRecord(phase: .transitioning, fans: entries, attemptedFanIndexes: attempts)
+                try FanTransitionRecordFile.write(transitionRecord, to: self.fanRecoveryURL)
+                fputs("CoolerMBP: event=ownership_record_retained phase=transitioning attemptedFan=\(index)\n", stderr)
+            }
             let raw = try fanController.status()
             try verifyRequestedMode(.maximum, raw: raw, level: clamped)
             try FanTransitionRecordFile.write(FanTransitionRecord(phase: .active, fans: entries), to: fanRecoveryURL)
+            fputs("CoolerMBP: event=ownership_record_retained phase=active fans=\(entries.count)\n", stderr)
             ownedFanTargets = Dictionary(uniqueKeysWithValues: raw.fans.map {
                 ($0.index, OwnedFanTarget(modeKey: $0.modeKey, targetRPM: $0.targetRPM))
             })
@@ -569,12 +580,26 @@ public final class ControllerRuntime {
         guard !current.fans.contains(where: { $0.mode == "manual" }) || hasVerifiedFanOwnership(current.fans) else {
             throw RuntimeTransitionError.failed("Manual fan ownership is unknown; refusing automatic restoration")
         }
-        try fanController.resetAppleAutomatic()
+        var attemptedModeKeys: [Int: String] = [:]
+        if case .record(let record) = FanTransitionRecordFile.read(from: fanRecoveryURL), record.phase == .transitioning {
+            guard record.matches(current.fans) else {
+                throw RuntimeTransitionError.failed("transition record does not match current fan state; preserving ownership record")
+            }
+            let attempted = record.attemptedFanIndexes.map { Set($0) } ?? Set(record.fans.map(\.index))
+            attemptedModeKeys = Dictionary(uniqueKeysWithValues: record.fans.filter { attempted.contains($0.index) }.map { ($0.index, $0.modeKey) })
+        }
+        do {
+            try fanController.resetAppleAutomatic(attemptedFanModeKeys: attemptedModeKeys)
+        } catch {
+            fputs("CoolerMBP: event=ownership_record_retained reason=automatic_restore_unverified error=\(error)\n", stderr)
+            throw error
+        }
         let raw = try fanController.status()
         guard raw.fans.allSatisfy({ $0.mode == "auto" || $0.mode == "system" }) else {
             throw RuntimeTransitionError.failed("fan mode readback did not confirm Apple Automatic")
         }
         try FanTransitionRecordFile.clear(at: fanRecoveryURL)
+        fputs("CoolerMBP: event=ownership_record_cleared reason=stable_automatic_verified\n", stderr)
         ownedFanTargets.removeAll()
         lastAppliedLevel = nil
         return raw

@@ -28,17 +28,20 @@ public struct FanTransitionRecord: Codable, Equatable, Sendable {
     public let version: Int
     public let phase: FanTransitionPhase
     public let fans: [FanTransitionEntry]
+    public let attemptedFanIndexes: [Int]?
 
-    public init(phase: FanTransitionPhase, fans: [FanTransitionEntry]) {
+    public init(phase: FanTransitionPhase, fans: [FanTransitionEntry], attemptedFanIndexes: [Int]? = nil) {
         self.version = Self.currentVersion
         self.phase = phase
         self.fans = fans
+        self.attemptedFanIndexes = attemptedFanIndexes
     }
 
     public func matches(_ readings: [FanReading]) -> Bool {
         guard version == Self.currentVersion, !fans.isEmpty, fans.count == readings.count else { return false }
         let readingsByIndex = Dictionary(uniqueKeysWithValues: readings.map { ($0.index, $0) })
         guard readingsByIndex.count == readings.count else { return false }
+        let attempted = attemptedFanIndexes.map { Set($0) } ?? Set(fans.map(\.index))
         for entry in fans {
             guard let reading = readingsByIndex[entry.index], reading.modeKey == entry.modeKey else { return false }
             let atTarget = reading.mode == "manual" && abs(reading.targetRPM - entry.targetRPM) <= 100
@@ -47,8 +50,10 @@ public struct FanTransitionRecord: Codable, Equatable, Sendable {
                 continue
             }
             let atPrevious = reading.mode == entry.previousMode && abs(reading.targetRPM - entry.previousTargetRPM) <= 100
-            let manualBeforeTargetWrite = reading.mode == "manual" && abs(reading.targetRPM - entry.previousTargetRPM) <= 100
-            guard atTarget || atPrevious || manualBeforeTargetWrite else { return false }
+            let manualOwnedByAttempt = reading.mode == "manual" && attempted.contains(entry.index) &&
+                (atTarget || abs(reading.targetRPM - entry.previousTargetRPM) <= 100)
+            let previouslyManual = entry.previousMode == "manual" && atPrevious
+            guard atPrevious || manualOwnedByAttempt || previouslyManual else { return false }
         }
         return true
     }
@@ -112,17 +117,35 @@ public enum FanTransitionRecovery {
         allowUnknownFtst: Bool = false
     ) throws -> RawThermalStatus {
         let current = try controller.status()
+        var attemptedModeKeys: [Int: String] = [:]
+        let recordRead = FanTransitionRecordFile.read(from: recordURL)
+        if case .record(let record) = recordRead, record.phase == .transitioning {
+            guard record.matches(current.fans) else {
+                throw FanTransitionRecoveryError.unknownFanOwnership
+            }
+            let attempted = record.attemptedFanIndexes.map(Set.init) ?? Set(record.fans.map(\.index))
+            attemptedModeKeys = Dictionary(uniqueKeysWithValues: record.fans.filter { attempted.contains($0.index) }.map { ($0.index, $0.modeKey) })
+        }
         if current.fans.contains(where: { $0.mode == "manual" }), !allowUnknownFans {
-            guard case .record(let record) = FanTransitionRecordFile.read(from: recordURL), record.matches(current.fans) else {
+            guard case .record(let record) = recordRead, record.matches(current.fans) else {
                 throw FanTransitionRecoveryError.unknownFanOwnership
             }
         }
-        try controller.resetAppleAutomatic(allowUnknownFtstRelease: allowUnknownFtst)
+        do {
+            try controller.resetAppleAutomatic(
+                allowUnknownFtstRelease: allowUnknownFtst,
+                attemptedFanModeKeys: attemptedModeKeys
+            )
+        } catch {
+            fputs("CoolerMBP: event=ownership_record_retained reason=automatic_restore_unverified error=\(error)\n", stderr)
+            throw error
+        }
         let verified = try controller.status()
         guard verified.fans.allSatisfy({ $0.mode == "auto" || $0.mode == "system" }) else {
             throw FanTransitionRecoveryError.unverifiedAutomaticState
         }
         try FanTransitionRecordFile.clear(at: recordURL)
+        fputs("CoolerMBP: event=ownership_record_cleared reason=stable_automatic_verified\n", stderr)
         return verified
     }
 }
