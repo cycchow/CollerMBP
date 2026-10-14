@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
-cd "$(dirname "$0")"
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_ROOT"
 
 LABEL="com.superstring.CoolerMBP.daemon"
 ROOT="${COOLERMBP_INSTALL_ROOT:-}"
@@ -13,6 +14,7 @@ PLIST="$ROOT/Library/LaunchDaemons/$LABEL.plist"
 HELPER="$ROOT/Library/PrivilegedHelperTools/$LABEL"
 CLI="$ROOT/usr/local/bin/coolermbpctl"
 SMC="$ROOT/usr/local/sbin/coolermbpsmc"
+NEW_SMC="$REPO_ROOT/dist/coolermbpsmc"
 RECOVER="$ROOT/usr/local/sbin/coolermbp-recover"
 APP="$ROOT/Applications/CoolerMBP.app"
 SUPPORT="$ROOT/Library/Application Support/CoolerMBP"
@@ -68,6 +70,7 @@ verify_standalone_status() {
     printf '%s\n' "$status" | ftst_is_inactive
 }
 show_failure_state() {
+  sudo_run mkdir -m 700 -p "$PRESERVE_DIR" || true
   {
     echo "--- service state ---"
     service_rc=0
@@ -126,13 +129,30 @@ save_initial_metadata() {
   return 0
 }
 wait_for_shutdown_and_lock() {
-  local attempt
+  local attempt lock_output="" lock_kind="" unloaded=false
   for ((attempt = 0; attempt < SHUTDOWN_TIMEOUT; attempt++)); do
     service_rc=0
     read_service >/dev/null || true
-    if service_absent && sudo_run "$SMC" lock-check >/dev/null 2>&1; then return 0; fi
+    if service_absent; then
+      unloaded=true
+      if lock_output="$(sudo_run "$NEW_SMC" lock-check 2>&1)"; then return 0; fi
+      if printf '%s\n' "$lock_output" | grep -Eqi 'usage:|unknown command|unrecognized command'; then
+        fail "new SMC utility does not support lock-check: $lock_output"
+      elif printf '%s\n' "$lock_output" | grep -Eqi 'Unable to acquire CoolerMBP SMC writer lock|writer lock.*unavailable'; then
+        lock_kind="busy"
+      else
+        fail "new SMC utility could not initialize or check the SMC writer lock: $lock_output"
+      fi
+    fi
     sleep "$POLL_INTERVAL"
   done
+  if ! $unloaded; then
+    fail "old service still loaded after ${SHUTDOWN_TIMEOUT}s: $service_output"
+  fi
+  case "$lock_kind" in
+    busy) fail "new SMC utility could not acquire the writer lock after ${SHUTDOWN_TIMEOUT}s: $lock_output" ;;
+    *) fail "new SMC utility could not verify the SMC writer lock" ;;
+  esac
   return 1
 }
 wait_for_ready() {
@@ -168,8 +188,14 @@ wait_for_ready() {
 }
 trap 'on_error "$?" "$LINENO"' ERR
 
-save_initial_metadata || fail "could not preserve the initial recovery metadata"
 ./build.sh
+save_initial_metadata || fail "could not preserve the initial recovery metadata"
+if [[ ! -f "$NEW_SMC" ]]; then
+  fail "new SMC utility is missing: $NEW_SMC"
+fi
+if [[ ! -x "$NEW_SMC" ]]; then
+  fail "new SMC utility cannot execute: $NEW_SMC"
+fi
 
 sudo_run mkdir -p "$ROOT/Library/PrivilegedHelperTools" "$ROOT/Library/LaunchDaemons" || fail "could not prepare system install directories"
 
@@ -188,8 +214,8 @@ fi
 echo "Previous service is unloaded and the SMC writer lock is available."
 
 echo "Requesting and verifying Apple Automatic once before replacing installed files."
-sudo_run dist/coolermbpsmc auto || fail "standalone Apple Automatic restoration failed"
-standalone="$(sudo_run dist/coolermbpsmc status 2>&1)" || fail "could not read standalone SMC status after restoration"
+sudo_run "$NEW_SMC" auto || fail "standalone Apple Automatic restoration failed"
+standalone="$(sudo_run "$NEW_SMC" status 2>&1)" || fail "could not read standalone SMC status after restoration"
 if ! verify_standalone_status "$standalone"; then
   echo "$standalone" >&2
   fail "standalone status did not verify all fans automatic and Ftst absent/inactive"

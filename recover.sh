@@ -55,12 +55,25 @@ verify_standalone_status() {
     printf '%s\n' "$status" | ftst_is_inactive
 }
 wait_for_shutdown_and_lock() {
-  local attempt
+  local attempt lock_output="" unloaded=false
   for ((attempt = 0; attempt < SHUTDOWN_TIMEOUT; attempt++)); do
     read_service || true
-    if service_absent && sudo_run "$SMC" lock-check >/dev/null 2>&1; then return 0; fi
+    if service_absent; then
+      unloaded=true
+      if lock_output="$(sudo_run "$SMC" lock-check 2>&1)"; then return 0; fi
+      if printf '%s\n' "$lock_output" | grep -Eqi 'usage:|unknown command|unrecognized command'; then
+        fail "installed SMC utility does not support lock-check; recovery metadata is preserved: $lock_output"
+      fi
+      if ! printf '%s\n' "$lock_output" | grep -Eqi 'Unable to acquire CoolerMBP SMC writer lock|writer lock.*unavailable'; then
+        fail "installed SMC utility could not initialize or check the SMC writer lock: $lock_output"
+      fi
+    fi
     sleep "$POLL_INTERVAL"
   done
+  if ! $unloaded; then
+    fail "daemon still loaded after ${SHUTDOWN_TIMEOUT}s: $service_output"
+  fi
+  fail "installed SMC utility could not acquire the writer lock after ${SHUTDOWN_TIMEOUT}s: $lock_output"
   return 1
 }
 wait_for_ready() {
@@ -156,8 +169,11 @@ on_error() {
 trap 'on_error "$?" "$LINENO"' ERR
 
 save_initial_metadata || fail "could not preserve the initial recovery metadata"
+if [[ ! -e "$SMC" ]]; then
+  fail "installed SMC recovery utility is missing: $SMC; recovery metadata is preserved"
+fi
 if [[ ! -x "$SMC" ]]; then
-  fail "recovery tool is missing; no SMC changes were made"
+  fail "installed SMC recovery utility cannot execute: $SMC; recovery metadata is preserved"
 fi
 
 # Prefer the running daemon. A successful request is accepted only after the
