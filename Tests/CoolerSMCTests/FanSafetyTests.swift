@@ -97,6 +97,39 @@ final class FanSafetyTests: XCTestCase {
         XCTAssertTrue(FanController(smc: smc).hardwareInfo.contains("firmware=Optional(130)"))
     }
 
+    func testOrdinaryRecoveryRefusesUnknownManualFanOwnership() {
+        let smc = MockSMC(fanCount: 1)
+        smc.values["F0md"] = [1]
+
+        XCTAssertThrowsError(try FanTransitionRecovery.restoreAppleAutomatic(using: FanController(smc: smc)))
+        XCTAssertEqual(smc.values["F0md"], [1])
+        XCTAssertNil(smc.writeCounts["F0md"])
+    }
+
+    func testExplicitFanRecoveryOverridesUnknownManualOwnership() throws {
+        let smc = MockSMC(fanCount: 1)
+        smc.values["F0md"] = [1]
+
+        let restored = try FanTransitionRecovery.restoreAppleAutomatic(
+            using: FanController(smc: smc), allowUnknownFans: true
+        )
+        XCTAssertEqual(restored.fans.first?.mode, "auto")
+        XCTAssertEqual(smc.values["F0md"], [0])
+    }
+
+    func testExplicitFanRecoveryStillRequiresKnownFtstOwnership() {
+        let smc = MockSMC(fanCount: 1, hasFtst: true)
+        smc.values["F0md"] = [1]
+        smc.values["Ftst"] = [1]
+
+        XCTAssertThrowsError(try FanTransitionRecovery.restoreAppleAutomatic(
+            using: FanController(smc: smc), allowUnknownFans: true
+        ))
+        XCTAssertEqual(smc.values["F0md"], [1])
+        XCTAssertNil(smc.writeCounts["F0md"])
+        XCTAssertNil(smc.writeCounts["Ftst"])
+    }
+
     func testUnsupportedFtstFormatBlocksRecoveryBeforeWrites() {
         let smc = MockSMC(fanCount: 1, hasFtst: true)
         smc.values["F0md"] = [1]
@@ -309,6 +342,30 @@ final class FanSafetyTests: XCTestCase {
         smc.values["F1Md"] = [0]
         let status = try FanController(smc: smc).status()
         XCTAssertEqual(status.fans.map(\.modeKey), ["F0md", "F1Md"])
+    }
+
+    func testBothModeAliasesPreferAndKeepLowercaseKey() throws {
+        let smc = MockSMC(fanCount: 1)
+        smc.values["F0Md"] = [3]
+        let controller = FanController(smc: smc)
+
+        XCTAssertEqual(try controller.status().fans.first?.modeKey, "F0md")
+        XCTAssertNoThrow(try controller.setCoolingLevel(0.5))
+        XCTAssertEqual(smc.values["F0md"], [1])
+        XCTAssertEqual(smc.values["F0Md"], [3])
+        XCTAssertEqual(smc.writeCounts["F0Md"], nil)
+    }
+
+    func testRejectedPreferredModeAliasDoesNotProbeUppercase() {
+        let smc = MockSMC(fanCount: 1)
+        smc.values["F0Md"] = [3]
+        smc.rejectedWrites.insert("F0md")
+        let controller = FanController(smc: smc)
+
+        XCTAssertThrowsError(try controller.setCoolingLevel(0.5))
+        XCTAssertEqual(smc.values["F0Md"], [3])
+        XCTAssertNil(smc.writeCounts["F0Md"])
+        XCTAssertNil(smc.writeCounts["Ftst"])
     }
 }
 

@@ -52,13 +52,15 @@ The installer builds locally, asks an existing daemon to restore Apple Automatic
 - **Cool Surface** — proactive temperature-driven curve above.
 - **Maximum** — both/all fans at the maximum RPM reported by SMC.
 
-CoolerMBP first tries direct per-fan mode control. It considers the experimental `Ftst` fallback only when a fan reports system-managed mode and a direct write is rejected by SMC firmware. `Ftst` is never written when unavailable, unreadable, already active with unknown ownership, or when recovery metadata cannot be stored. Ownership metadata is written before `Ftst=1`; successful Apple Automatic reconciliation verifies each fan and the `Ftst` readback before clearing ownership.
+CoolerMBP first tries direct per-fan mode control. It considers the experimental `Ftst` fallback only when a fan reports system-managed mode and a direct write is rejected by SMC firmware. `Ftst` is never written when unavailable, unreadable, already active with unknown ownership, or when recovery metadata cannot be stored. Ftst ownership metadata is separate from fan-control ownership metadata.
+
+Before a manual transition, the daemon atomically records each fan's prior state and intended target in `/Library/Application Support/CoolerMBP/fan-recovery.json`; it marks the record active only after target readback succeeds. On restart or an ordinary Auto request, the daemon restores fans only when the recorded transition matches the observed mode keys and targets. Missing, invalid, or mismatched records leave manual fans untouched and set recovery required. This record is evidence of CoolerMBP's transition, not an Apple-provided process identity: another controller that writes identical values cannot be distinguished by AppleSMC.
 
 ### SMC write inventory
 
 | Key | Value/type | When written | Verification and restoration |
 |---|---|---|---|
-| `F%dMd` or `F%dmd` | `1` (`ui8`) | Direct manual-mode request; key spelling is discovered per fan. | Read back mode `1`; fallback is only considered for firmware rejection `0x82` from mode `3`. Automatic restore writes `0` and verifies mode `0` or system-managed `3`. |
+| `F%dmd` (preferred) or `F%dMd` (fallback only when lowercase is confirmed absent) | `1` (`ui8`) | Direct manual-mode request; the selected key is cached per fan for the connection. | Read back mode `1`; fallback is only considered for firmware rejection `0x82` from mode `3`. Automatic restore writes `0` and verifies mode `0` or system-managed `3`. |
 | `F%dTg` | Calculated target RPM (`flt`) | Manual operation, using that fan's reported min/max range and the requested cooling level. | Read back mode and target within 100 RPM; failure triggers verified automatic restoration. |
 | `Ftst` | `1` / `0` (`ui8`) | `1` only for the compatible fallback after root-owned recovery metadata is atomically saved; `0` only to release an owned flag, or from the explicit unknown-ownership recovery command. | Read back the exact value. Ownership lives at `/Library/Application Support/CoolerMBP/recovery.json` and is cleared only after verified release. |
 
@@ -86,13 +88,19 @@ sudo /usr/local/sbin/coolermbp-recover
 
 The standalone tool is read-only except for explicit recovery commands; use `coolermbpctl max` for maximum cooling while the daemon is available.
 
-If status reports active Ftst with unknown ownership, `auto` deliberately refuses to clear it. After stopping other fan-control tools and deciding to return control to macOS, the explicit administrative recovery is:
+Ordinary `auto` refuses manual fan states without a matching CoolerMBP transition record. If the daemon is running, the CLI and app report the explicit recovery command. After stopping the daemon and competing fan-control tools, confirming the writer lock is released, and deciding to override unknown fan ownership, run:
+
+```bash
+sudo /usr/local/sbin/coolermbpsmc recover-unknown-fans
+```
+
+Unknown Ftst ownership remains a separate condition. After stopping other fan-control tools and deciding to return control to macOS, run:
 
 ```bash
 sudo /usr/local/sbin/coolermbpsmc recover-unknown-ftst
 ```
 
-It restores fan modes, writes `Ftst=0` only on this explicit command, verifies the readback, and leaves recovery metadata intact unless CoolerMBP had recorded ownership.
+The `recover-unknown-ftst` command authorizes releasing unknown Ftst only when fan ownership is already known. If both fan and Ftst ownership are unknown, the combined administrative override is `sudo /usr/local/sbin/coolermbpsmc recover-unknown`. Each command verifies Apple Automatic before reporting success. These commands can overwrite another fan controller's settings; use them only after deciding to return control to macOS. After explicit recovery, rerun `sudo /usr/local/sbin/coolermbp-recover` to verify the state and restart the daemon.
 
 To inspect raw status:
 

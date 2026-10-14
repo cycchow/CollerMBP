@@ -15,7 +15,7 @@ final class ControllerRuntimeTests: XCTestCase {
         XCTAssertEqual(status.hardwareVerified, true)
         XCTAssertTrue(status.fans.allSatisfy { $0.mode == "manual" })
         XCTAssertEqual(try JSONDecoder().decode(DaemonConfig.self, from: Data(contentsOf: configURL)).mode, .maximum)
-        XCTAssertGreaterThan(smc.writeCounts["F0Md"] ?? 0, 0)
+        XCTAssertGreaterThan(smc.writeCounts["F0md"] ?? 0, 0)
     }
 
     func testUnexpectedManualTargetChangePausesWithoutRecoveryWrites() throws {
@@ -32,7 +32,7 @@ final class ControllerRuntimeTests: XCTestCase {
 
     func testStartupManualStateIsUnownedAndReadOnly() {
         let (runtime, smc, _) = makeRuntime()
-        smc.values["F0Md"] = [1]
+        smc.values["F0md"] = [1]
         let writesBeforeStartup = smc.totalWrites
         XCTAssertThrowsError(try runtime.startupRecoveryForTesting().get())
         XCTAssertEqual(smc.totalWrites, writesBeforeStartup)
@@ -52,11 +52,103 @@ final class ControllerRuntimeTests: XCTestCase {
         XCTAssertEqual(status(of: runtime).hardwareVerified, true)
     }
 
+    func testStartupRestoresManualFansMatchingOwnedRecoveryRecord() throws {
+        let configURL = URL(fileURLWithPath: "/private/tmp/CoolerMBP-config-\(UUID().uuidString)/config.json")
+        let recoveryURL = configURL.deletingLastPathComponent().appendingPathComponent("fan-recovery.json")
+        let smc = MockSMC(fanCount: 1)
+        smc.values["F0md"] = [1]
+        smc.values["F0Tg"] = Self.floatBytes(6000)
+        let entry = FanTransitionEntry(index: 0, modeKey: "F0md", previousMode: "auto", previousTargetRPM: 2000, targetRPM: 6000)
+        try FanTransitionRecordFile.write(FanTransitionRecord(phase: .active, fans: [entry]), to: recoveryURL)
+        let runtime = ControllerRuntime(fanController: FanController(smc: smc), configURL: configURL)
+
+        XCTAssertNoThrow(try runtime.startupRecoveryForTesting().get())
+        XCTAssertEqual(status(of: runtime).fans.first?.mode, "auto")
+        XCTAssertEqual(FanTransitionRecordFile.read(from: recoveryURL).isMissing, true)
+    }
+
+    func testStartupWithInvalidRecordLeavesManualFansUntouched() throws {
+        let configURL = URL(fileURLWithPath: "/private/tmp/CoolerMBP-config-\(UUID().uuidString)/config.json")
+        let recoveryURL = configURL.deletingLastPathComponent().appendingPathComponent("fan-recovery.json")
+        try FileManager.default.createDirectory(at: recoveryURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("invalid".utf8).write(to: recoveryURL)
+        let smc = MockSMC(fanCount: 1)
+        smc.values["F0md"] = [1]
+        let runtime = ControllerRuntime(fanController: FanController(smc: smc), configURL: configURL)
+        let writesBefore = smc.totalWrites
+
+        XCTAssertThrowsError(try runtime.startupRecoveryForTesting().get())
+        XCTAssertEqual(smc.totalWrites, writesBefore)
+        XCTAssertEqual(status(of: runtime).recoveryRequired, true)
+    }
+
+    func testStartupWithStaleRecordLeavesChangedManualTargetUntouched() throws {
+        let configURL = URL(fileURLWithPath: "/private/tmp/CoolerMBP-config-\(UUID().uuidString)/config.json")
+        let recoveryURL = configURL.deletingLastPathComponent().appendingPathComponent("fan-recovery.json")
+        let smc = MockSMC(fanCount: 1)
+        smc.values["F0md"] = [1]
+        smc.values["F0Tg"] = Self.floatBytes(4200)
+        let entry = FanTransitionEntry(index: 0, modeKey: "F0md", previousMode: "auto", previousTargetRPM: 2000, targetRPM: 6000)
+        try FanTransitionRecordFile.write(FanTransitionRecord(phase: .active, fans: [entry]), to: recoveryURL)
+        let runtime = ControllerRuntime(fanController: FanController(smc: smc), configURL: configURL)
+        let writesBefore = smc.totalWrites
+
+        XCTAssertThrowsError(try runtime.startupRecoveryForTesting().get())
+        XCTAssertEqual(smc.totalWrites, writesBefore)
+        XCTAssertEqual(status(of: runtime).recoveryRequired, true)
+    }
+
+    func testStartupReconcilesMatchingPartialTransition() throws {
+        let configURL = URL(fileURLWithPath: "/private/tmp/CoolerMBP-config-\(UUID().uuidString)/config.json")
+        let recoveryURL = configURL.deletingLastPathComponent().appendingPathComponent("fan-recovery.json")
+        let smc = MockSMC(fanCount: 2)
+        smc.values["F0md"] = [1]
+        smc.values["F0Tg"] = Self.floatBytes(6000)
+        let entries = (0..<2).map { index in
+            FanTransitionEntry(index: index, modeKey: "F\(index)md", previousMode: "auto", previousTargetRPM: 2000, targetRPM: 6000)
+        }
+        try FanTransitionRecordFile.write(FanTransitionRecord(phase: .transitioning, fans: entries), to: recoveryURL)
+        let runtime = ControllerRuntime(fanController: FanController(smc: smc), configURL: configURL)
+
+        XCTAssertNoThrow(try runtime.startupRecoveryForTesting().get())
+        XCTAssertTrue(status(of: runtime).fans.allSatisfy { $0.mode == "auto" })
+    }
+
+    func testOrdinaryAutoRefusesUnknownManualOwnership() throws {
+        let (runtime, smc, _) = makeRuntime()
+        smc.values["F0md"] = [1]
+        let writesBefore = smc.totalWrites
+        let result = setMode(.appleAuto, on: runtime)
+
+        XCTAssertThrowsError(try result.get()) { error in
+            XCTAssertTrue(String(describing: error).contains("recover-unknown-fans"))
+        }
+        XCTAssertEqual(smc.totalWrites, writesBefore)
+        XCTAssertEqual(status(of: runtime).recoveryRequired, true)
+    }
+
+    func testRecoveryMetadataWriteFailurePreventsManualSMCWrites() throws {
+        let blocker = URL(fileURLWithPath: "/private/tmp/CoolerMBP-blocker-\(UUID().uuidString)")
+        try Data("file".utf8).write(to: blocker)
+        defer { try? FileManager.default.removeItem(at: blocker) }
+        let configURL = URL(fileURLWithPath: "/private/tmp/CoolerMBP-config-\(UUID().uuidString)/config.json")
+        let smc = MockSMC(fanCount: 1)
+        let runtime = ControllerRuntime(
+            fanController: FanController(smc: smc), configURL: configURL,
+            fanRecoveryURL: blocker.appendingPathComponent("fan-recovery.json")
+        )
+
+        XCTAssertThrowsError(try setMode(.maximum, on: runtime).get())
+        XCTAssertEqual(smc.values["F0md"], [0])
+        XCTAssertNil(smc.writeCounts["F0md"])
+        XCTAssertNil(smc.writeCounts["F0Tg"])
+    }
+
     func testPartialTransitionRecoveryFailureBlocksTimerUntilExplicitRecovery() throws {
         let configURL = URL(fileURLWithPath: "/private/tmp/CoolerMBP-config-\(UUID().uuidString)/config.json")
         let smc = MockSMC(fanCount: 2)
         smc.failingWrites = { key, bytes in
-            key == "F1Md" && bytes == [1] || key == "F0Md" && bytes == [0]
+            key == "F1md" && bytes == [1] || key == "F0md" && bytes == [0]
         }
         let runtime = ControllerRuntime(fanController: FanController(smc: smc), configURL: configURL)
 
@@ -90,8 +182,9 @@ final class ControllerRuntimeTests: XCTestCase {
         try Data("file".utf8).write(to: blocker)
         defer { try? FileManager.default.removeItem(at: blocker) }
         let configURL = blocker.appendingPathComponent("config.json")
+        let fanRecoveryURL = URL(fileURLWithPath: "/private/tmp/CoolerMBP-fan-recovery-\(UUID().uuidString).json")
         let smc = MockSMC(fanCount: 1)
-        let runtime = ControllerRuntime(fanController: FanController(smc: smc), configURL: configURL)
+        let runtime = ControllerRuntime(fanController: FanController(smc: smc), configURL: configURL, fanRecoveryURL: fanRecoveryURL)
 
         XCTAssertThrowsError(try setMode(.maximum, on: runtime).get())
         let status = status(of: runtime)
@@ -128,6 +221,13 @@ final class ControllerRuntimeTests: XCTestCase {
     private static func floatBytes(_ value: Float) -> [UInt8] {
         var value = value
         return withUnsafeBytes(of: &value) { Array($0) }
+    }
+}
+
+private extension FanTransitionRecordRead {
+    var isMissing: Bool {
+        if case .missing = self { return true }
+        return false
     }
 }
 

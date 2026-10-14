@@ -46,6 +46,7 @@ public final class FanController {
     private var ownsFtst: Bool
     private var manualStrategy = "notApplicable"
     private var lastTransitionDate: Date?
+    private var modeKeys: [Int: String] = [:]
 
     private static let fanCountKey = "FNum"
     private static let forceTestKey = "Ftst"
@@ -461,20 +462,37 @@ public final class FanController {
     }
 
     private func modeKey(for index: Int) throws -> String {
-        var failures: [String] = []
-        for template in [Self.modeUpperTemplate, Self.modeLowerTemplate] {
-            let key = Self.key(template, fan: index)
-            switch smc.getKeyInfo(key) {
-            case .available(let size, let type):
-                if size == 1 && type == "ui8 " { return key }
-                failures.append("\(key) unsupported format size=\(size) type=\(type)")
-            case .absent:
-                continue
-            case .failure(let failure):
-                failures.append("\(key) discovery failed: \(failure)")
+        if let cached = modeKeys[index] { return cached }
+
+        // Lowercase is the known-working spelling on supported Apple Silicon.
+        // Use uppercase only when lowercase is confirmed absent.
+        let lowerKey = Self.key(Self.modeLowerTemplate, fan: index)
+        switch smc.getKeyInfo(lowerKey) {
+        case .available(let size, let type):
+            guard size == 1, type == "ui8 " else {
+                throw FanControllerError.readFailed("\(lowerKey) unsupported format size=\(size) type=\(type)")
             }
+            modeKeys[index] = lowerKey
+            return lowerKey
+        case .failure(let failure):
+            throw FanControllerError.readFailed("\(lowerKey) discovery failed: \(failure)")
+        case .absent:
+            break
         }
-        throw FanControllerError.readFailed("F\(index)Md/F\(index)md (\(failures.joined(separator: "; ")))")
+
+        let upperKey = Self.key(Self.modeUpperTemplate, fan: index)
+        switch smc.getKeyInfo(upperKey) {
+        case .available(let size, let type):
+            guard size == 1, type == "ui8 " else {
+                throw FanControllerError.readFailed("\(upperKey) unsupported format size=\(size) type=\(type)")
+            }
+            modeKeys[index] = upperKey
+            return upperKey
+        case .failure(let failure):
+            throw FanControllerError.readFailed("\(upperKey) discovery failed: \(failure)")
+        case .absent:
+            throw FanControllerError.readFailed("F\(index)Md/F\(index)md (both aliases confirmed absent)")
+        }
     }
 
     private func persistOwnership(_ owned: Bool) throws {

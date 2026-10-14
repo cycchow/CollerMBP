@@ -30,7 +30,11 @@ while (( SECONDS < deadline )); do
       exit 0
     fi
     echo "Standalone recovery failed. The daemon remains disabled and recovery metadata is preserved." >&2
-    echo "Inspect with: sudo $SMC status. For an explicitly approved unknown Ftst state, review before running: sudo $SMC recover-unknown-ftst" >&2
+    echo "Inspect with: sudo $SMC status. If another fan tool may own manual mode, do not override it." >&2
+    echo "After stopping competing fan tools, explicit fan recovery is: sudo $SMC recover-unknown-fans" >&2
+    echo "For unknown Ftst ownership use: sudo $SMC recover-unknown-ftst" >&2
+    echo "Only when both unknown states are intentionally overridden use: sudo $SMC recover-unknown" >&2
+    echo "After explicit recovery succeeds, rerun sudo /usr/local/sbin/coolermbp-recover to verify and restart the daemon." >&2
     exit 1
   fi
   sleep 0.25

@@ -43,6 +43,7 @@ public final class ControllerRuntime {
     private static let fanResponseFailurePollLimit = 3
 
     private let configURL: URL
+    private let fanRecoveryURL: URL
 
     public convenience init() throws {
         let lock = try? SMCWriterLock()
@@ -50,14 +51,16 @@ public final class ControllerRuntime {
         self.init(
             fanController: controller,
             writerLock: lock,
-            configURL: URL(fileURLWithPath: "/Library/Application Support/CoolerMBP/config.json")
+            configURL: URL(fileURLWithPath: "/Library/Application Support/CoolerMBP/config.json"),
+            fanRecoveryURL: FanTransitionRecordFile.defaultURL
         )
     }
 
-    init(fanController: FanController, writerLock: SMCWriterLock? = nil, configURL: URL) {
+    init(fanController: FanController, writerLock: SMCWriterLock? = nil, configURL: URL, fanRecoveryURL: URL? = nil) {
         self.writerLock = writerLock
         self.fanController = fanController
         self.configURL = configURL
+        self.fanRecoveryURL = fanRecoveryURL ?? configURL.deletingLastPathComponent().appendingPathComponent("fan-recovery.json")
         config = Self.loadConfig(from: configURL) ?? DaemonConfig()
         requestedMode = config.mode
         cachedStatus = DaemonStatus(
@@ -75,11 +78,7 @@ public final class ControllerRuntime {
             do {
                 // Never resume a persisted manual request before reconciling
                 // hardware state left by a previous daemon instance.
-                let initial = try self.fanController.status()
-                guard !initial.fans.contains(where: { $0.mode == "manual" }) else {
-                    throw RuntimeTransitionError.failed("Manual fan state at startup has no in-memory CoolerMBP ownership")
-                }
-                let raw = try self.restoreAppleAutomatic()
+                let raw = try self.reconcileStartupState()
                 let candidate = DaemonConfig(mode: .appleAuto)
                 try self.saveConfig(candidate)
                 self.config = candidate
@@ -112,7 +111,7 @@ public final class ControllerRuntime {
             timer = nil
             do {
                 let raw = try fanController.status()
-                guard !raw.fans.contains(where: { $0.mode == "manual" }) || ownsCurrentManualState(raw.fans) else {
+                guard !raw.fans.contains(where: { $0.mode == "manual" }) || hasVerifiedFanOwnership(raw.fans) else {
                     throw RuntimeTransitionError.failed("Refusing shutdown restore because manual fan ownership is unknown")
                 }
                 _ = try restoreAppleAutomatic()
@@ -126,6 +125,10 @@ public final class ControllerRuntime {
             if mode == .appleAuto {
                 self.requestedMode = .appleAuto
                 do {
+                    let current = try self.fanController.status()
+                    guard !current.fans.contains(where: { $0.mode == "manual" }) || self.hasVerifiedFanOwnership(current.fans) else {
+                        throw RuntimeTransitionError.failed("Manual fan ownership is unknown. Verify that no other fan controller is active, then run sudo /usr/local/sbin/coolermbpsmc recover-unknown-fans to explicitly return fans to macOS.")
+                    }
                     let raw = try self.restoreAppleAutomatic()
                     let candidate = DaemonConfig(mode: .appleAuto)
                     self.hardwareVerified = true
@@ -231,11 +234,7 @@ public final class ControllerRuntime {
     func startupRecoveryForTesting() -> Result<Void, Error> {
         queue.sync {
             do {
-                let initial = try fanController.status()
-                guard !initial.fans.contains(where: { $0.mode == "manual" }) else {
-                    throw RuntimeTransitionError.failed("Manual fan state at startup has no in-memory CoolerMBP ownership")
-                }
-                let raw = try restoreAppleAutomatic()
+                let raw = try reconcileStartupState()
                 let candidate = DaemonConfig(mode: .appleAuto)
                 try saveConfig(candidate)
                 config = candidate
@@ -277,7 +276,7 @@ public final class ControllerRuntime {
         do {
             var raw = try fanController.status()
             let hasManualFan = raw.fans.contains { $0.mode == "manual" }
-            if (hasManualFan && !ownsCurrentManualState(raw.fans)) || (!hasManualFan && lastAppliedLevel != nil) {
+            if (hasManualFan && !hasVerifiedFanOwnership(raw.fans)) || (!hasManualFan && lastAppliedLevel != nil) {
                 recoveryRequired = true
                 hardwareVerified = false
                 lastAppliedLevel = nil
@@ -425,7 +424,7 @@ public final class ControllerRuntime {
                 let observed = try fanController.status()
                 actualStatus = observed
                 let hasManualFan = observed.fans.contains { $0.mode == "manual" }
-                guard !hasManualFan || ownsCurrentManualState(observed.fans) else {
+                guard !hasManualFan || hasVerifiedFanOwnership(observed.fans) else {
                     throw RuntimeTransitionError.failed("manual fan ownership is unknown; refusing recovery writes")
                 }
                 let verified = try restoreAppleAutomatic()
@@ -468,9 +467,25 @@ public final class ControllerRuntime {
         let clamped = min(max(level, 0), 1)
         let needsRefresh = Date().timeIntervalSince(lastApplyDate) >= 10
         if lastAppliedLevel == nil || abs((lastAppliedLevel ?? 0) - clamped) >= 0.025 || needsRefresh {
+            let before = try fanController.status()
+            let entries = before.fans.map { fan in
+                let target = Double(fan.minRPM) + clamped * Double(fan.maxRPM - fan.minRPM)
+                return FanTransitionEntry(
+                    index: fan.index,
+                    modeKey: fan.modeKey ?? "",
+                    previousMode: fan.mode,
+                    previousTargetRPM: fan.targetRPM,
+                    targetRPM: Int(target.rounded())
+                )
+            }
+            guard entries.allSatisfy({ !$0.modeKey.isEmpty }) else {
+                throw RuntimeTransitionError.failed("Fan mode key could not be recorded before control transition")
+            }
+            try FanTransitionRecordFile.write(FanTransitionRecord(phase: .transitioning, fans: entries), to: fanRecoveryURL)
             try fanController.setCoolingLevel(clamped)
             let raw = try fanController.status()
             try verifyRequestedMode(.maximum, raw: raw, level: clamped)
+            try FanTransitionRecordFile.write(FanTransitionRecord(phase: .active, fans: entries), to: fanRecoveryURL)
             ownedFanTargets = Dictionary(uniqueKeysWithValues: raw.fans.map {
                 ($0.index, OwnedFanTarget(modeKey: $0.modeKey, targetRPM: $0.targetRPM))
             })
@@ -550,14 +565,23 @@ public final class ControllerRuntime {
     }
 
     private func restoreAppleAutomatic() throws -> RawThermalStatus {
+        let current = try fanController.status()
+        guard !current.fans.contains(where: { $0.mode == "manual" }) || hasVerifiedFanOwnership(current.fans) else {
+            throw RuntimeTransitionError.failed("Manual fan ownership is unknown; refusing automatic restoration")
+        }
         try fanController.resetAppleAutomatic()
         let raw = try fanController.status()
         guard raw.fans.allSatisfy({ $0.mode == "auto" || $0.mode == "system" }) else {
             throw RuntimeTransitionError.failed("fan mode readback did not confirm Apple Automatic")
         }
+        try FanTransitionRecordFile.clear(at: fanRecoveryURL)
         ownedFanTargets.removeAll()
         lastAppliedLevel = nil
         return raw
+    }
+
+    private func reconcileStartupState() throws -> RawThermalStatus {
+        try restoreAppleAutomatic()
     }
 
     private func ownsCurrentManualState(_ fans: [FanReading]) -> Bool {
@@ -566,6 +590,12 @@ public final class ControllerRuntime {
             guard let owned = ownedFanTargets[fan.index] else { return false }
             return fan.mode == "manual" && fan.modeKey == owned.modeKey && abs(fan.targetRPM - owned.targetRPM) <= 100
         }
+    }
+
+    private func hasVerifiedFanOwnership(_ fans: [FanReading]) -> Bool {
+        if ownsCurrentManualState(fans) { return true }
+        guard case .record(let record) = FanTransitionRecordFile.read(from: fanRecoveryURL) else { return false }
+        return record.matches(fans)
     }
 
     private func verifyRequestedMode(_ mode: CoolingMode, raw: RawThermalStatus, level: Double? = nil) throws {

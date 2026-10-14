@@ -19,6 +19,14 @@ func printStatus(_ controller: FanController) throws {
     }
 }
 
+func restoreAppleAutomatic(_ controller: FanController, allowUnknownFans: Bool = false, allowUnknownFtst: Bool = false) throws {
+    try FanTransitionRecovery.restoreAppleAutomatic(
+        using: controller,
+        allowUnknownFans: allowUnknownFans,
+        allowUnknownFtst: allowUnknownFtst
+    )
+}
+
 func requestedMode() -> String {
     let path = "/Library/Application Support/CoolerMBP/config.json"
     guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
@@ -55,13 +63,23 @@ do {
     case "auto", "reset":
         let writerLock = try SMCWriterLock()
         defer { withExtendedLifetime(writerLock) {} }
-        try controller.resetAppleAutomatic()
+        try restoreAppleAutomatic(controller)
         print("fan control returned to macOS")
+    case "recover-unknown-fans":
+        let writerLock = try SMCWriterLock()
+        defer { withExtendedLifetime(writerLock) {} }
+        try restoreAppleAutomatic(controller, allowUnknownFans: true)
+        print("explicitly recovered unknown manual fan control; Apple Automatic verified")
     case "recover-unknown-ftst":
         let writerLock = try SMCWriterLock()
         defer { withExtendedLifetime(writerLock) {} }
-        try controller.resetAppleAutomatic(allowUnknownFtstRelease: true)
+        try restoreAppleAutomatic(controller, allowUnknownFtst: true)
         print("unknown Ftst override explicitly released and verified")
+    case "recover-unknown":
+        let writerLock = try SMCWriterLock()
+        defer { withExtendedLifetime(writerLock) {} }
+        try restoreAppleAutomatic(controller, allowUnknownFans: true, allowUnknownFtst: true)
+        print("explicitly recovered unknown fan and Ftst ownership; Apple Automatic verified")
     case "lock-check":
         let writerLock = try SMCWriterLock()
         defer { withExtendedLifetime(writerLock) {} }
@@ -70,7 +88,7 @@ do {
         fputs("Standalone maximum control is disabled. Use sudo coolermbpctl max while the daemon is running.\n", stderr)
         exit(2)
     default:
-        print("usage: sudo coolermbpsmc [status|diagnose|auto|recover-unknown-ftst|lock-check]")
+        print("usage: sudo coolermbpsmc [status|diagnose|auto|recover-unknown-fans|recover-unknown-ftst|recover-unknown|lock-check]")
         exit(2)
     }
 } catch {
