@@ -66,6 +66,9 @@ public final class FanController {
     private let writeEnabled: Bool
     private let modelIdentifier: String?
     private let timing: FanControllerTiming
+#if DEBUG
+    private var manualControlForTesting = false
+#endif
     private var ownsFtst: Bool
     private var manualStrategy = "notApplicable"
     private var lastTransitionDate: Date?
@@ -116,7 +119,7 @@ public final class FanController {
         smc: any SMCTransport,
         recoveryURL: URL? = nil,
         writeEnabled: Bool = true,
-        modelIdentifier: String? = "TestModel",
+        modelIdentifier: String? = nil,
         timing: FanControllerTiming = .testing
     ) {
         self.smc = smc
@@ -126,6 +129,21 @@ public final class FanController {
         self.timing = timing
         self.ownsFtst = Self.readOwnership(from: recoveryURL)
     }
+
+#if DEBUG
+    // Test-only SMC mock seam. This initializer is omitted from production builds.
+    convenience init(
+        smc: any SMCTransport,
+        recoveryURL: URL? = nil,
+        writeEnabled: Bool = true,
+        modelIdentifier: String? = nil,
+        timing: FanControllerTiming = .testing,
+        manualControlForTesting: Bool
+    ) {
+        self.init(smc: smc, recoveryURL: recoveryURL, writeEnabled: writeEnabled, modelIdentifier: modelIdentifier, timing: timing)
+        self.manualControlForTesting = manualControlForTesting
+    }
+#endif
 
     public var hardwareInfo: String {
         let capability = discoverFtst()
@@ -297,12 +315,21 @@ public final class FanController {
 
     public func manualTransitionRestriction(for fans: [FanReading]) -> String? {
         if modelIdentifier == "Mac14,9" {
-            return "manual control is disabled on Mac14,9: mode writes can activate before a nonzero target is established"
+            return "manual control is disabled on Mac14,9 after an observed zero-RPM manual transition"
         }
-        if let fan = fans.first(where: { $0.mode != "manual" && $0.targetRPM <= 0 }) {
-            return "fan \(fan.index) modeKey=\(fan.modeKey ?? "unknown") mode=\(fan.mode) targetRPM=\(fan.targetRPM); refusing manual mode because nonzero target-before-mode behavior is unverified"
+        if let fan = fans.first(where: { $0.minRPM <= 0 || $0.maxRPM <= $0.minRPM }) {
+            return "fan \(fan.index) reported invalid min/max RPM limits"
         }
-        return nil
+        if let fan = fans.first(where: { $0.mode != "manual" && $0.targetRPM < $0.minRPM }) {
+            return "fan \(fan.index) modeKey=\(fan.modeKey ?? "unknown") mode=\(fan.mode) targetRPM=\(fan.targetRPM) minRPM=\(fan.minRPM); refusing manual mode below the reported minimum"
+        }
+#if DEBUG
+        if manualControlForTesting { return nil }
+#endif
+        guard let modelIdentifier, !modelIdentifier.isEmpty else {
+            return "manual control is disabled because the hardware model identifier is unavailable"
+        }
+        return "manual control is disabled on unvalidated hardware model \(modelIdentifier)"
     }
 
     public func setMaximum() throws {

@@ -5,6 +5,10 @@ import CoolerShared
 @testable import CoolerDaemonCore
 
 final class ControllerRuntimeTests: XCTestCase {
+    private func transitionTestController(_ smc: MockSMC) -> FanController {
+        FanController(smc: smc, manualControlForTesting: true)
+    }
+
     func testManualModePersistsOnlyAfterHardwareVerification() throws {
         let (runtime, smc, configURL) = makeRuntime()
         let result = setMode(.maximum, on: runtime)
@@ -44,7 +48,7 @@ final class ControllerRuntimeTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: configURL.deletingLastPathComponent()) }
         try FileManager.default.createDirectory(at: configURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try JSONEncoder().encode(DaemonConfig(mode: .maximum)).write(to: configURL)
-        let runtime = ControllerRuntime(fanController: FanController(smc: MockSMC(fanCount: 1)), configURL: configURL)
+        let runtime = ControllerRuntime(fanController: transitionTestController(MockSMC(fanCount: 1)), configURL: configURL)
 
         XCTAssertNoThrow(try runtime.startupRecoveryForTesting().get())
         XCTAssertEqual(status(of: runtime).mode, .appleAuto)
@@ -60,7 +64,7 @@ final class ControllerRuntimeTests: XCTestCase {
         smc.values["F0Tg"] = Self.floatBytes(6000)
         let entry = FanTransitionEntry(index: 0, modeKey: "F0md", previousMode: "auto", previousTargetRPM: 2000, targetRPM: 6000)
         try FanTransitionRecordFile.write(FanTransitionRecord(phase: .active, fans: [entry]), to: recoveryURL)
-        let runtime = ControllerRuntime(fanController: FanController(smc: smc), configURL: configURL)
+        let runtime = ControllerRuntime(fanController: transitionTestController(smc), configURL: configURL)
 
         XCTAssertNoThrow(try runtime.startupRecoveryForTesting().get())
         XCTAssertEqual(status(of: runtime).fans.first?.mode, "auto")
@@ -74,7 +78,7 @@ final class ControllerRuntimeTests: XCTestCase {
         try Data("invalid".utf8).write(to: recoveryURL)
         let smc = MockSMC(fanCount: 1)
         smc.values["F0md"] = [1]
-        let runtime = ControllerRuntime(fanController: FanController(smc: smc), configURL: configURL)
+        let runtime = ControllerRuntime(fanController: transitionTestController(smc), configURL: configURL)
         let writesBefore = smc.totalWrites
 
         XCTAssertThrowsError(try runtime.startupRecoveryForTesting().get())
@@ -90,7 +94,7 @@ final class ControllerRuntimeTests: XCTestCase {
         smc.values["F0Tg"] = Self.floatBytes(4200)
         let entry = FanTransitionEntry(index: 0, modeKey: "F0md", previousMode: "auto", previousTargetRPM: 2000, targetRPM: 6000)
         try FanTransitionRecordFile.write(FanTransitionRecord(phase: .active, fans: [entry]), to: recoveryURL)
-        let runtime = ControllerRuntime(fanController: FanController(smc: smc), configURL: configURL)
+        let runtime = ControllerRuntime(fanController: transitionTestController(smc), configURL: configURL)
         let writesBefore = smc.totalWrites
 
         XCTAssertThrowsError(try runtime.startupRecoveryForTesting().get())
@@ -108,7 +112,7 @@ final class ControllerRuntimeTests: XCTestCase {
             FanTransitionEntry(index: index, modeKey: "F\(index)md", previousMode: "auto", previousTargetRPM: 2000, targetRPM: 6000)
         }
         try FanTransitionRecordFile.write(FanTransitionRecord(phase: .transitioning, fans: entries), to: recoveryURL)
-        let runtime = ControllerRuntime(fanController: FanController(smc: smc), configURL: configURL)
+        let runtime = ControllerRuntime(fanController: transitionTestController(smc), configURL: configURL)
 
         XCTAssertNoThrow(try runtime.startupRecoveryForTesting().get())
         XCTAssertTrue(status(of: runtime).fans.allSatisfy { $0.mode == "auto" })
@@ -134,7 +138,7 @@ final class ControllerRuntimeTests: XCTestCase {
         let configURL = URL(fileURLWithPath: "/private/tmp/CoolerMBP-config-\(UUID().uuidString)/config.json")
         let smc = MockSMC(fanCount: 1)
         let runtime = ControllerRuntime(
-            fanController: FanController(smc: smc), configURL: configURL,
+            fanController: transitionTestController(smc), configURL: configURL,
             fanRecoveryURL: blocker.appendingPathComponent("fan-recovery.json")
         )
 
@@ -152,7 +156,7 @@ final class ControllerRuntimeTests: XCTestCase {
         smc.failingWrites = { key, bytes in
             key == "F1md" && bytes == [1] || key == "F0md" && bytes == [0]
         }
-        let runtime = ControllerRuntime(fanController: FanController(smc: smc), configURL: configURL)
+        let runtime = ControllerRuntime(fanController: transitionTestController(smc), configURL: configURL)
 
         XCTAssertThrowsError(try setMode(.maximum, on: runtime).get())
         XCTAssertEqual(status(of: runtime).recoveryRequired, true)
@@ -188,7 +192,7 @@ final class ControllerRuntimeTests: XCTestCase {
         let configURL = blocker.appendingPathComponent("config.json")
         let fanRecoveryURL = URL(fileURLWithPath: "/private/tmp/CoolerMBP-fan-recovery-\(UUID().uuidString).json")
         let smc = MockSMC(fanCount: 1)
-        let runtime = ControllerRuntime(fanController: FanController(smc: smc), configURL: configURL, fanRecoveryURL: fanRecoveryURL)
+        let runtime = ControllerRuntime(fanController: transitionTestController(smc), configURL: configURL, fanRecoveryURL: fanRecoveryURL)
 
         XCTAssertThrowsError(try setMode(.maximum, on: runtime).get())
         let status = status(of: runtime)
@@ -202,7 +206,7 @@ final class ControllerRuntimeTests: XCTestCase {
     private func makeRuntime() -> (ControllerRuntime, MockSMC, URL) {
         let configURL = URL(fileURLWithPath: "/private/tmp/CoolerMBP-config-\(UUID().uuidString)/config.json")
         let smc = MockSMC(fanCount: 1)
-        let runtime = ControllerRuntime(fanController: FanController(smc: smc), configURL: configURL)
+        let runtime = ControllerRuntime(fanController: transitionTestController(smc), configURL: configURL)
         return (runtime, smc, configURL)
     }
 

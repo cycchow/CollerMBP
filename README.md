@@ -9,7 +9,7 @@ A small native macOS menu-bar fan controller aimed at keeping an Apple-silicon M
 - Xcode / Command Line Tools with Swift
 - Local/admin installation
 
-This package is source-only. It has **not been hardware-tested by the package authoring environment on an M3 Max** and intentionally does not include a pre-signed binary.
+This package is source-only and intentionally does not include a pre-signed binary. **Manual SMC fan control is disabled on all production hardware until a model-specific mode/target sequence has been validated.** In particular, manual control is disabled on Mac14,9 after the real M2 Pro failure documented below. M3 Max manual control is not validated.
 
 ## What it does
 
@@ -46,25 +46,31 @@ cd CoolerMBP
 
 The installer builds locally, requests a controlled shutdown of an existing daemon, waits for it to unload and release the SMC writer lock, and verifies Apple Automatic before replacing installed files. It enables the LaunchDaemon before bootstrapping it once; RunAtLoad starts it. A bounded readiness check verifies service load, process state, XPC ping, requested/persisted Apple Automatic, fan modes, recovery state, and Ftst before reporting success. It does not use `launchctl kickstart -k`. On failure it returns nonzero, reports the current service/hardware state, and retains a metadata snapshot under `/var/tmp/CoolerMBP-install-*`.
 
-For approval-gated, read-only-first validation on the M2 Pro and M3 Max, see [the hardware validation runbook](docs/HARDWARE_VALIDATION.md). The diagnostic collector is `scripts/collect-hardware-diagnostics.sh`.
+For read-only inventory and Apple Automatic verification on the M2 Pro and M3 Max, see [the hardware validation runbook](docs/HARDWARE_VALIDATION.md). These procedures are separate from manual fan-control validation. The diagnostic collector is `scripts/collect-hardware-diagnostics.sh`.
+
+## M2 Pro failure and current validation status
+
+On a real Mac14,9 Apple M2 Pro running macOS 27.0.1, `sudo coolermbpctl max` received an accepted `F0Md` mode=1 write, but the immediate readback did not confirm Manual. Fan 0 later reported Manual with a 0 RPM target; Fan 1 remained Apple Automatic. Normal Auto recovery refused because ownership could not be verified. After unloading the daemon and verifying writer-lock availability, the operator explicitly ran unknown-fan recovery; it succeeded and both fans returned to Apple Automatic.
+
+Manual control is disabled on Mac14,9. **M2 Pro Phase 4 must not be repeated.** M3 Max manual control is not yet validated. Read-only inventory and Apple Automatic verification are separate from manual fan-control validation. Cool Surface may be accepted at low temperature while the fans stay automatic; that is not evidence of validated manual cooling. No stress testing is authorized.
 
 ## Modes
 
 - **Apple Automatic** — no manual override; macOS controls the fans.
-- **Cool Surface** — proactive temperature-driven curve above.
-- **Maximum** — both/all fans at the maximum RPM reported by SMC.
+- **Cool Surface** — proactive temperature-driven policy above. A low-temperature request may be accepted while fans remain Apple Automatic; this does not validate manual cooling.
+- **Maximum** — a manual-control request. Production hardware currently fails closed; it does not enable fan writes.
 
-CoolerMBP first tries direct per-fan mode control. It considers the experimental `Ftst` fallback only when a fan reports system-managed mode and a direct write is rejected by SMC firmware. `Ftst` is never written when unavailable, unreadable, already active with unknown ownership, or when recovery metadata cannot be stored. Ftst ownership metadata is separate from fan-control ownership metadata.
+The lower-level SMC transition implementation is covered by deterministic mocks, but production eligibility currently denies manual control on every hardware model. No model has evidence supporting a safe mode/target write sequence, and no unvalidated model is implicitly allowed. The experimental `Ftst` fallback remains guarded and is not reached by an ineligible manual request. `Ftst` is never written when unavailable, unreadable, already active with unknown ownership, or when recovery metadata cannot be stored. Ftst ownership metadata is separate from fan-control ownership metadata.
 
-Before a manual transition, the daemon atomically records each fan's prior state and intended target in `/Library/Application Support/CoolerMBP/fan-recovery.json`; it marks the record active only after target readback succeeds. On restart or an ordinary Auto request, the daemon restores fans only when the recorded transition matches the observed mode keys and targets. Missing, invalid, or mismatched records leave manual fans untouched and set recovery required. This record is evidence of CoolerMBP's transition, not an Apple-provided process identity: another controller that writes identical values cannot be distinguished by AppleSMC.
+If a future reviewed build enables manual control for a validated model, the daemon records attempted fan transitions before writes and retains recovery metadata until Apple Automatic is verified. On restart or an ordinary Auto request, the daemon restores fans only when the recorded transition matches the observed mode keys and targets. Missing, invalid, or mismatched records leave manual fans untouched and set recovery required. This record is evidence of CoolerMBP's transition, not an Apple-provided process identity: another controller that writes identical values cannot be distinguished by AppleSMC.
 
 ### SMC write inventory
 
 | Key | Value/type | When written | Verification and restoration |
 |---|---|---|---|
-| `F%dmd` (preferred) or `F%dMd` (fallback only when lowercase is confirmed absent) | `1` (`ui8`) | Direct manual-mode request; the selected key is cached per fan for the connection. | Read back mode `1`; fallback is only considered for firmware rejection `0x82` from mode `3`. Automatic restore writes `0` and verifies mode `0` or system-managed `3`. |
-| `F%dTg` | Calculated target RPM (`flt`) | Manual operation, using that fan's reported min/max range and the requested cooling level. | Read back mode and target within 100 RPM; failure triggers verified automatic restoration. |
-| `Ftst` | `1` / `0` (`ui8`) | `1` only for the compatible fallback after root-owned recovery metadata is atomically saved; `0` only to release an owned flag, or from the explicit unknown-ownership recovery command. | Read back the exact value. Ownership lives at `/Library/Application Support/CoolerMBP/recovery.json` and is cleared only after verified release. |
+| `F%dmd` (preferred) or `F%dMd` (fallback only when lowercase is confirmed absent) | `1` / `0` (`ui8`) | The low-level transition path supports these values for deterministic tests and recovery. Production manual-mode requests are currently denied on all models; mode `0` remains available to verified recovery. | Manual mode is read back with a bounded delay in the low-level path. Apple Automatic restoration has bounded stabilization verification. |
+| `F%dTg` | Calculated target RPM (`flt`) | Low-level manual transition path only; the production eligibility gate currently prevents target writes. | Target must be within the reported fan limits and read back within 100 RPM. |
+| `Ftst` | `1` / `0` (`ui8`) | The `1` fallback remains unreachable through production manual requests while hardware eligibility is denied. `0` is written only to release an owned flag or from explicit unknown-ownership recovery. | Read back the exact value. Ownership lives at `/Library/Application Support/CoolerMBP/recovery.json` and is cleared only after verified release. |
 
 `F%dAc`, `F%dMn`, and `F%dMx` are read only. CoolerMBP does not write `Ftst` on direct-mode success and never writes mode `3`.
 
@@ -80,6 +86,8 @@ sudo coolermbpctl max
 sudo coolermbpctl auto
 ```
 
+`cool` may persist a policy request when no manual cooling is required; do not treat that as validated manual control. `max` is currently denied by the production hardware eligibility gate. Do not use it for testing on the M2 Pro or M3 Max.
+
 ## Emergency recovery
 
 Try the daemon-supervised restore first. The helper verifies daemon status and direct SMC state before reporting success. If the daemon request fails, it requests a controlled shutdown, waits up to 20 seconds for the service to unload and the writer lock to become available, then runs and verifies the standalone restore. If the daemon request succeeds but verification fails, it stops with an error rather than issuing another restoration request. The fallback enables and bootstraps the service once, then waits for XPC and verifies the daemon and direct hardware state:
@@ -88,7 +96,7 @@ Try the daemon-supervised restore first. The helper verifies daemon status and d
 sudo /usr/local/sbin/coolermbp-recover
 ```
 
-The standalone tool is read-only except for explicit recovery commands; use `coolermbpctl max` for maximum cooling while the daemon is available.
+The standalone tool is read-only except for explicit recovery commands. Do not use `coolermbpctl max` to validate hardware: production manual control is disabled until model-specific evidence and review exist.
 
 On failure, `coolermbp-recover` returns nonzero and reports launchd state, daemon status, direct SMC status, metadata files, and recent logs. It preserves a copy of the original recovery metadata and a failure report under `/var/tmp/CoolerMBP-recovery-*`; inspect these files before follow-up. It does not disable the service permanently and never invokes unknown-ownership recovery automatically. A successful `launchctl bootout` requests service shutdown, but does not prove application-level cleanup; actual fan and Ftst readback is required.
 
